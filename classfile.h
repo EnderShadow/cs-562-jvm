@@ -36,6 +36,10 @@ typedef struct method {
     uint8_t numParameters;
 } method_t;
 
+#define CLASS_STATUS_NOT_LOADED 0
+#define CLASS_STATUS_LOADING 1
+#define CLASS_STATUS_LOADED 2
+
 struct class {
     char *name;
     struct class *thisClass;
@@ -49,6 +53,7 @@ struct class {
     uint16_t numFields;
     uint16_t objectSize;
     uint16_t flags;
+    uint8_t status;
 };
 
 /**

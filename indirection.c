@@ -83,6 +83,8 @@ slot_t allocateSlot(addr_ind_info_t * addrInfo) {
         pthread_mutex_unlock(&addrInfo->freeListMutex);
         slot_t slot = freeSlot->slot;
         free(freeSlot);
+        // prevent automatic freeing
+        addrInfo->addressTable[slot] = (void *) -1;
         return slot;
     }
     pthread_mutex_unlock(&addrInfo->freeListMutex);
@@ -96,6 +98,8 @@ slot_t allocateSlot(addr_ind_info_t * addrInfo) {
         ++addrInfo->numPages;
     }
     slot_t slot = addrInfo->numAddresses++;
+    // prevent automatic freeing
+    addrInfo->addressTable[slot] = (void *) -1;
     pthread_mutex_unlock(&addrInfo->slotAllocationMutex);
     return slot;
 }

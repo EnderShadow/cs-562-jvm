@@ -83,6 +83,12 @@ int main(int argc, char **args) {
         return 0;
     }
     
+    // initialize before parameters are parsed so that additional classpaths can be added
+    if(!initClassLoader()) {
+        printf("Failed to initialize class loader\n");
+        return 1;
+    }
+    
     // parse parameters
     for(int i = 1; i < argc; i++) {
         size_t strLen = strlen(args[i]);
@@ -200,11 +206,6 @@ int main(int argc, char **args) {
     
     if(!classOrJar) {
         printf("No class or jar was provided\n");
-        return 1;
-    }
-    
-    if(!initClassLoader()) {
-        printf("Failed to initialize class loader\n");
         return 1;
     }
     

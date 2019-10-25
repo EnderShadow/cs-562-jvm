@@ -8,6 +8,8 @@
 #include "classfile.h"
 #include <stdbool.h>
 
+#define E_CYCLIC_CLASS (void *) -1
+
 bool initClassLoader();
 
 bool addToClasspath(char *classpathLocation);
