@@ -33,7 +33,7 @@ slot_t newArray(uint8_t numDimensions, int32_t *sizes, class_t *class) {
     slot_t slot = allocateSlot(addrIndInfo);
     if(!slot)
         return 0;
-    char *className = malloc(numDimensions + 2 + strlen(class->name));
+    char *className = malloc(numDimensions + 3 + strlen(class->name));
     if(!className)
         goto fail1;
     int32_t i = 0;
@@ -43,6 +43,8 @@ slot_t newArray(uint8_t numDimensions, int32_t *sizes, class_t *class) {
         className[i++] = 'L';
     className[i] = '\0';
     className = strcat(className, class->name);
+    if(!isArrayClass(class) && !isPrimitiveClass(class))
+        className = strcat(className, ";");
     class_t *arrayClass = loadClass(className);
     if(!arrayClass)
         goto fail2;

@@ -17,9 +17,10 @@ struct hashmap {
     size_t length;
     size_t numEntries;
     float loadFactor;
+    bool (*equality_fn)(void *, void *);
 };
 
-hashmap_t *ht_createHashmap(size_t (*hash_fn)(void *), float loadFactor) {
+hashmap_t *ht_createHashmap(size_t (*hash_fn)(void *), bool (*equality_fn)(void *, void *), float loadFactor) {
     if(!hash_fn)
         return NULL;
     hashmap_t *hashmap = malloc(sizeof(hashmap_t *));
@@ -36,6 +37,7 @@ hashmap_t *ht_createHashmap(size_t (*hash_fn)(void *), float loadFactor) {
     hashmap->length = 16;
     hashmap->numEntries = 0;
     hashmap->loadFactor = loadFactor;
+    hashmap->equality_fn = equality_fn;
     return hashmap;
 }
 
@@ -95,7 +97,7 @@ void *ht_put(hashmap_t *hashmap, void *key, void *value) {
 
     // try to update existing key
     while(entry) {
-        if(entry->key == key) {
+        if(hashmap->equality_fn(entry->key, key)) {
             void *oldValue = entry->value;
             entry->value = value;
             return oldValue;
@@ -126,7 +128,7 @@ void *ht_delete(hashmap_t *hashmap, void *key) {
     entry_node_t *entry = hashmap->data[index];
 
     while(entry) {
-        if(entry->key == key) {
+        if(hashmap->equality_fn(entry->key, key)) {
             if(entry->prev)
                 entry->prev->next = entry->next;
             if(entry->next)
@@ -149,7 +151,7 @@ void *ht_get(hashmap_t *hashmap, void *key) {
     entry_node_t *entry = hashmap->data[index];
 
     while(entry) {
-        if(entry->key == key)
+        if(hashmap->equality_fn(entry->key, key))
             return entry->value;
         entry = entry->next;
     }
@@ -164,7 +166,7 @@ bool ht_contains(hashmap_t *hashmap, void *key) {
     entry_node_t *entry = hashmap->data[index];
 
     while(entry) {
-        if(entry->key == key)
+        if(hashmap->equality_fn(entry->key, key))
             return true;
         entry = entry->next;
     }

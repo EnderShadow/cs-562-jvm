@@ -7,7 +7,79 @@
 
 #include <stdint.h>
 
+typedef struct class_info {
+    uint8_t tag;
+    uint16_t nameIndex;
+} class_info_t;
+
+typedef struct field_method_interface_method_ref_info {
+    uint8_t tag;
+    uint16_t classIndex;
+    uint16_t nameAndTypeIndex;
+} field_method_interface_method_ref_info_t;
+
+typedef struct string_info {
+    uint8_t tag;
+    uint16_t stringIndex;
+} string_info_t;
+
+typedef struct integer_float_info {
+    uint8_t tag;
+    uint32_t bytes;
+} integer_float_info_t;
+
+typedef struct long_double_info {
+    uint8_t tag;
+    uint64_t bytes;
+} long_double_info_t;
+
+typedef struct name_and_type_info {
+    uint8_t tag;
+    uint16_t nameIndex;
+    uint16_t descriptorIndex;
+} name_and_type_info_t;
+
+typedef struct utf8_info {
+    uint8_t tag;
+    uint16_t length;
+    char *chars; // this is a null terminated string
+} utf8_info_t;
+
+typedef struct method_handle_info {
+    uint8_t tag;
+    uint8_t referenceKind;
+    uint16_t referenceIndex;
+} method_handle_info_t;
+
+typedef struct method_type_info {
+    uint8_t tag;
+    uint16_t descriptorIndex;
+} method_type_info_t;
+
+typedef struct invoke_dynamic_info {
+    uint8_t tag;
+    uint16_t bootstrapMethodAttrIndex;
+    uint16_t nameAndTypeIndex;
+} invoke_dynamic_info_t;
+
+typedef union constant_info {
+    class_info_t classInfo;
+    field_method_interface_method_ref_info_t fieldMethodInterfaceMethodRefInfo;
+    string_info_t stringInfo;
+    integer_float_info_t integerFloatInfo;
+    long_double_info_t longDoubleInfo;
+    name_and_type_info_t nameAndTypeInfo;
+    utf8_info_t utf8Info;
+    method_handle_info_t methodHandleInfo;
+    method_type_info_t methodTypeInfo;
+    invoke_dynamic_info_t invokeDynamicInfo;
+} constant_info_t;
+
 typedef struct class class_t;
+
+typedef union attribute_info {
+
+} attribute_info_t;
 
 typedef struct type_info {
     class_t *classPointer;
@@ -36,18 +108,19 @@ typedef struct method {
     uint8_t numParameters;
 } method_t;
 
-#define CLASS_STATUS_NOT_LOADED 0
-#define CLASS_STATUS_LOADING 1
-#define CLASS_STATUS_LOADED 2
+#define CLASS_STATUS_LOADING 0
+#define CLASS_STATUS_LOADED 1
 
 struct class {
     char *name;
+    constant_info_t **constantPool;
     struct class *thisClass;
     struct class *superClass;
     struct class **interfaces;
     method_t *methods;
     field_t *fields;
     void *staticFieldData;
+    uint16_t numConstants;
     uint16_t numInterfaces;
     uint16_t numMethods;
     uint16_t numFields;

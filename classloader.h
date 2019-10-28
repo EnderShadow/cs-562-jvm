@@ -8,11 +8,12 @@
 #include "classfile.h"
 #include <stdbool.h>
 
-#define E_CYCLIC_CLASS (void *) -1
-
 bool initClassLoader();
 
 bool addToClasspath(char *classpathLocation);
+
+// Used specifically when parsing field, method parameter, and method return types
+class_t *loadPrimitiveClass(char className);
 
 class_t *loadClass(char *className);
 

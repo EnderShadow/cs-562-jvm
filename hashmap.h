@@ -14,7 +14,7 @@ typedef struct ht_entry {
     void *value;
 } entry_t;
 
-hashmap_t *ht_createHashmap(size_t (*hash_fn)(void *), float loadFactor);
+hashmap_t *ht_createHashmap(size_t (*hash_fn)(void *), bool (*equality_fn)(void *, void *), float loadFactor);
 void ht_destroyHashmap(hashmap_t *hashmap);
 
 void *ht_put(hashmap_t *hashmap, void *key, void *value);
