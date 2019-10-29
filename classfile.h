@@ -77,6 +77,58 @@ typedef union constant_info {
 
 typedef struct class class_t;
 
+typedef struct constant_value_attribute {
+    char *name;
+    uint16_t constantIndex;
+} constant_value_attribute_t;
+
+typedef struct exception_table {
+    uint16_t startPC;
+    uint16_t endPC;
+    uint16_t handlerPC;
+    uint16_t catchType;
+} exception_table_t;
+
+typedef struct code_attribute {
+    char *name;
+    uint16_t maxStack;
+    uint16_t maxLocals;
+    uint64_t codeLength;
+    void *code;
+    uint16_t exceptionTableLength;
+    exception_table_t *exceptionHandlers;
+    uint16_t attributeCount;
+    attribute_info_t **attributes;
+} code_attribute_t;
+
+// This attribute is skipped over since it's only used for verification which this JVM does not do.
+typedef struct stack_map_table_attribute {
+    char *name;
+    // TODO complete in the future
+} stack_map_table_attribute_t;
+
+typedef struct exceptions_attribute {
+    char *name;
+    uint16_t numExceptions;
+    class_t **exceptions;
+} exceptions_attribute_t;
+
+// This attribute is skipped over since it's not needed for proper execution
+typedef struct inner_classes_attribute {
+    char *name;
+    // TODO complete in the future
+} inner_classes_attribute_t;
+
+// This attribute is skipped over since it's not needed for proper execution
+typedef struct enclosing_method_attribute {
+    char *name;
+    // TODO complete in the future
+} enclosing_method_attribute_t;
+
+typedef struct synthetic_attribute {
+    char *name;
+} synthetic_attribute_t;
+
 typedef union attribute_info {
 
 } attribute_info_t;
@@ -92,10 +144,6 @@ typedef struct field {
     uint32_t objectOffset;
     uint16_t flags;
 } field_t;
-
-typedef struct exception_table {
-
-} exception_table_t;
 
 typedef struct method {
     char *name;
