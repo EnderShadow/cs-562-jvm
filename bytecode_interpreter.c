@@ -172,8 +172,8 @@ int handle_instr_xastore(jthread_t *jthread) {
 }
 
 int handle_instr_unknown(jthread_t *jthread, bool wide) {
-	// TODO throw exception
-	return -1;
+    throwException(jthread, "java/lang/InternalError", "Unimplemented Instruction");
+    return 0;
 }
 
 int handle_instr_nop(jthread_t *jthread, bool wide) {
@@ -1452,7 +1452,8 @@ int handle_instr_invokeinterface(jthread_t *jthread, bool wide) {
 }
 
 int handle_instr_invokedynamic(jthread_t *jthread, bool wide) {
-	
+    throwException(jthread, "java/lang/InternalError", "Unimplemented Instruction");
+    return 0;
 }
 
 int handle_instr_new(jthread_t *jthread, bool wide) {

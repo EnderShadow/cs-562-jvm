@@ -77,6 +77,8 @@ typedef union constant_info {
 
 typedef struct class class_t;
 
+typedef union attribute_info attribute_info_t;
+
 typedef struct constant_value_attribute {
     char *name;
     uint16_t constantIndex;
@@ -101,37 +103,27 @@ typedef struct code_attribute {
     attribute_info_t **attributes;
 } code_attribute_t;
 
-// This attribute is skipped over since it's only used for verification which this JVM does not do.
-typedef struct stack_map_table_attribute {
+// This attribute represents any skipped attribute
+typedef struct skipped_attribute {
     char *name;
-    // TODO complete in the future
-} stack_map_table_attribute_t;
-
-typedef struct exceptions_attribute {
-    char *name;
-    uint16_t numExceptions;
-    class_t **exceptions;
-} exceptions_attribute_t;
-
-// This attribute is skipped over since it's not needed for proper execution
-typedef struct inner_classes_attribute {
-    char *name;
-    // TODO complete in the future
-} inner_classes_attribute_t;
-
-// This attribute is skipped over since it's not needed for proper execution
-typedef struct enclosing_method_attribute {
-    char *name;
-    // TODO complete in the future
-} enclosing_method_attribute_t;
+} skipped_attribute_t;
 
 typedef struct synthetic_attribute {
     char *name;
 } synthetic_attribute_t;
 
-typedef union attribute_info {
+typedef struct signature_attribute {
+    char *name;
+    uint16_t signatureIndex;
+} signature_attribute_t;
 
-} attribute_info_t;
+union attribute_info {
+    constant_value_attribute_t constantValueAttribute;
+    code_attribute_t codeAttribute;
+    skipped_attribute_t skippedAttribute;
+    synthetic_attribute_t syntheticAttribute;
+    signature_attribute_t signatureAttribute;
+};
 
 typedef struct type_info {
     class_t *classPointer;
@@ -141,15 +133,20 @@ typedef struct type_info {
 typedef struct field {
     type_t type;
     char *name;
+    attribute_info_t **attributes;
     uint32_t objectOffset;
+    uint16_t numAttributes;
     uint16_t flags;
 } field_t;
 
 typedef struct method {
+    type_t returnType;
     char *name;
     type_t *parameterTypes;
     void *codeLocation;
     exception_table_t *exceptionTable;
+    attribute_info_t **attributes;
+    uint16_t numAttributes;
     uint16_t numLocals;
     uint16_t maxStack;
     uint16_t flags;

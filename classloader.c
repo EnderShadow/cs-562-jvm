@@ -15,6 +15,7 @@
 #include "utils.h"
 #include "flags.h"
 #include "dataTypes.h"
+#include "attributes.h"
 
 char **classpath = NULL;
 int classpathLength = 0;
@@ -139,6 +140,10 @@ class_t *loadArrayClass(char *className) {
     return NULL;
 }
 
+bool parseMethodDescriptor(method_t *method, class_t *class, char *methodDescriptor) {
+    return false;
+}
+
 class_t *parseClassFile(void *classData) {
     if(readu4(classData) != 0xCAFEBABEu) {
         printf("Invalid class magic: %X\n", readu4(classData));
@@ -219,8 +224,8 @@ class_t *parseClassFile(void *classData) {
     
     class->numFields = readu2(classData);
     classData += 2;
-    class->fields = malloc(sizeof(field_t) * class->numFields);
-    for(size_t i = 0; i < class->numFields; i++) {
+    class->fields = calloc(class->numFields, sizeof(field_t));
+    for(size_t i = 0; i < class->numFields; ++i) {
         field_t *field = class->fields + i;
         field->flags = readu2(classData);
         uint16_t nameIndex = readu2(classData + 2);
@@ -229,7 +234,12 @@ class_t *parseClassFile(void *classData) {
         char *descriptor = class->constantPool[descriptorIndex]->utf8Info.chars;
         if(descriptor[0] == 'L') {
             field->type.type = TYPE_REFERENCE;
-            // TODO
+            size_t descriptorLength = strlen(descriptor);
+            descriptor[descriptorLength - 1] = '\0';
+            field->type.classPointer = loadClass0(descriptor + 1);
+            descriptor[descriptorLength - 1] = ';';
+            if(!field->type.classPointer)
+                goto fail4;
         }
         else if(descriptor[0] == '[') {
             field->type.type = TYPE_REFERENCE;
@@ -271,9 +281,14 @@ class_t *parseClassFile(void *classData) {
                     goto fail4;
             }
         }
-        uint16_t attributesCount = readu2(classData + 6);
+        field->numAttributes = readu2(classData + 6);
         classData += 8;
-        // TODO attributes
+        field->attributes = calloc(field->numAttributes, sizeof(attribute_info_t *));
+        if(!field->attributes)
+            goto fail4;
+        classData = parseAttributes(field->numAttributes, field->attributes, class, classData);
+        if(!classData)
+            goto fail4;
     }
     
     // ============================================
@@ -282,14 +297,48 @@ class_t *parseClassFile(void *classData) {
     
     class->numMethods = readu2(classData);
     classData += 2;
-    class->methods = malloc(sizeof(method_t) * class->numMethods);
+    class->methods = calloc(class->numMethods, sizeof(method_t));
+    if(!class->methods)
+        goto fail4;
+    for(int i = 0; i < class->numMethods; ++i) {
+        method_t *method = class->methods + i;
+        method->flags = readu2(classData);
+        uint16_t nameIndex = readu2(classData + 2);
+        method->name = class->constantPool[nameIndex]->utf8Info.chars;
+        uint16_t descriptorIndex = readu2(classData + 4);
+        char *descriptor = class->constantPool[descriptorIndex]->utf8Info.chars;
+        bool success = parseMethodDescriptor(method, class, descriptor);
+        
+        // TODO
+    
+        method->numAttributes = readu2(classData + 6);
+        classData += 8;
+        
+        // TODO
+    }
+    
+    // ============================================
+    // parse attributes
+    // ============================================
     
     // TODO
     
     class->status = CLASS_STATUS_LOADED;
     return class;
     
-    fail4: free(class->fields);
+    fail4:
+    for(int i = 0; i < class->numFields; ++i) {
+        field_t *field = class->fields + i;
+        if(!field)
+            break;
+        for(int j = 0; j < field->numAttributes; ++j) {
+            if(!field->attributes[j])
+                break;
+            free(field->attributes[j]);
+        }
+        free(field->attributes);
+    }
+    free(class->fields);
     fail3: free(class->interfaces);
     fail2: ht_delete(loadedClasses, class->name);
     for(int i = 0; i < class->numConstants; i++) {
