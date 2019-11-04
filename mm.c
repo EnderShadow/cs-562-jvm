@@ -22,6 +22,7 @@ slot_t newObject(class_t *class) {
         }
         setRawAddress(addrIndInfo, slot, object);
         object->class = class;
+        jlock_init(&object->jlock);
         object->slot = slot;
     }
     return slot;
@@ -33,7 +34,7 @@ slot_t newArray(uint8_t numDimensions, int32_t *sizes, class_t *class) {
     slot_t slot = allocateSlot(addrIndInfo);
     if(!slot)
         return 0;
-    char *className = malloc(numDimensions + 3 + strlen(class->name));
+    char *className = malloc(numDimensions + 3u + strlen(class->name));
     if(!className)
         goto fail1;
     int32_t i = 0;
@@ -49,11 +50,12 @@ slot_t newArray(uint8_t numDimensions, int32_t *sizes, class_t *class) {
     if(!arrayClass)
         goto fail2;
     int elementSize = arrayElementSize(arrayClass);
-    array_object_t *arrayObj = allocateArrayObject(arrayClass, elementSize, sizes[0], numDimensions == 1);
+    object_t *arrayObj = allocateArrayObject(arrayClass, elementSize, sizes[0], numDimensions == 1);
     if(!arrayObj)
         goto fail2;
     setRawAddress(addrIndInfo, slot, arrayObj);
     arrayObj->class = arrayClass;
+    jlock_init(&arrayObj->jlock);
     arrayObj->slot = slot;
     arrayObj->length = sizes[0];
     

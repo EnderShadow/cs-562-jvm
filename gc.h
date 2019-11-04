@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include "jthread.h"
 
 enum gcMode {
     GC_MODE_NORMAL,
@@ -22,6 +23,9 @@ extern volatile atomic_uint_fast32_t numThreadsWaiting;
 extern pthread_mutex_t gcRunningMutex;
 
 void savePoint();
+
+bool registerThread(jthread_t *jthread);
+void unregisterThread(jthread_t *jthread);
 
 pthread_t *initGC();
 

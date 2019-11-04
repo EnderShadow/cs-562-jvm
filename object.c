@@ -4,7 +4,7 @@
 
 #include "object.h"
 
-uint8_t getArrayElementType(array_object_t *obj) {
+uint8_t getArrayElementType(object_t *obj) {
     char elementType = obj->class->name[1];
     switch(elementType) {
         case 'Z': return TYPE_BOOLEAN;
@@ -21,7 +21,7 @@ uint8_t getArrayElementType(array_object_t *obj) {
     }
 }
 
-cell_t getArrayElement(array_object_t *obj, int32_t index, uint8_t *type) {
+cell_t getArrayElement(object_t *obj, int32_t index, uint8_t *type) {
     cell_t cell;
     void *arrayData = obj + 1;
     
@@ -76,7 +76,7 @@ cell_t getArrayElement(array_object_t *obj, int32_t index, uint8_t *type) {
     return cell;
 }
 
-double_cell_t getArrayElement2(array_object_t *obj, int32_t index, uint8_t *type) {
+double_cell_t getArrayElement2(object_t *obj, int32_t index, uint8_t *type) {
     double_cell_t cell;
     void *arrayData = obj + 1;
     
@@ -101,7 +101,7 @@ double_cell_t getArrayElement2(array_object_t *obj, int32_t index, uint8_t *type
     return cell;
 }
 
-void setArrayElement(array_object_t *obj, int32_t index, cell_t value) {
+void setArrayElement(object_t *obj, int32_t index, cell_t value) {
     void *arrayData = obj + 1;
     
     char elementType = obj->class->name[1];
@@ -135,7 +135,7 @@ void setArrayElement(array_object_t *obj, int32_t index, cell_t value) {
     }
 }
 
-void setArrayElement2(array_object_t *obj, int32_t index, double_cell_t value) {
+void setArrayElement2(object_t *obj, int32_t index, double_cell_t value) {
     void *arrayData = obj + 1;
     
     char elementType = obj->class->name[1];

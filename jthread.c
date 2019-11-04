@@ -9,6 +9,7 @@
 #include "bytecode_interpreter.h"
 #include <stdio.h>
 #include <stdatomic.h>
+#include "flags.h"
 
 atomic_int nextThreadId = 1;
 
@@ -31,38 +32,39 @@ jthread_t *createThread(char *name, method_t *method, object_t *arg, size_t stac
     jthread->stackSize = stackSize;
     if(method->numParameters)
         ((cell_t *) jthread->stack)->a = arg->slot;
-    jthread->currentStackFrame = jthread->stack + ALIGN(method->numLocals * sizeof(cell_t));
+    jthread->currentStackFrame = jthread->stack + ALIGN(method->codeAttribute->maxLocals * sizeof(cell_t));
     stack_frame_t *stackFrame = jthread->currentStackFrame;
     stackFrame->currentMethod = method;
     stackFrame->previousStackFrame = NULL;
     stackFrame->prevFramePC = NULL;
     stackFrame->localVariableBase = jthread->stack;
     stackFrame->operandStackTypeBase = (void *) stackFrame + sizeof(stackFrame);
-    stackFrame->operandStackBase = (void *) stackFrame->operandStackTypeBase + ALIGN(method->maxStack);
+    stackFrame->operandStackBase = (void *) stackFrame->operandStackTypeBase + ALIGN(method->codeAttribute->maxStack);
     stackFrame->topOfStack = 0;
-    jthread->pc = method->codeLocation;
+    jthread->pc = method->codeAttribute->code;
     jthread->id = nextThreadId++;
     
     return jthread;
 }
 
 void destroyThread(jthread_t *jthread) {
-    --numThreads;
     munmap(jthread->stack, jthread->stackSize);
     free(jthread);
 }
 
 void *threadRoutine(void *jthread) {
     pthread_detach(pthread_self());
-    int result = run(jthread);
+    bc_interpreter_t interpreter;
+    interpreter.jthread = jthread;
+    registerThread(jthread);
+    int result = run(&interpreter);
+    unregisterThread(jthread);
     // TODO check result
     destroyThread(jthread);
     return jthread;
 }
 
 void threadStart(jthread_t *jthread) {
-    ++numThreads;
-    // TODO start thread
     if(pthread_create(&jthread->pthread, NULL, threadRoutine, jthread)) {
         destroyThread(jthread);
         printf("Failed to start thread. Thread has been destroyed\n");
@@ -71,13 +73,13 @@ void threadStart(jthread_t *jthread) {
 
 cell_t readLocal(stack_frame_t *stackFrame, uint16_t index, uint8_t *type) {
     if(type)
-        *type = stackFrame->currentMethod->parameterTypes[index].type;
+        *type = getTypeFromMethodDescriptor(stackFrame->currentMethod->descriptor, index, stackFrame->currentMethod->flags & METHOD_ACC_STATIC);
     return stackFrame->localVariableBase[index];
 }
 
 double_cell_t readLocal2(stack_frame_t *stackFrame, uint16_t index, uint8_t *type) {
     if(type)
-        *type = stackFrame->currentMethod->parameterTypes[index].type;
+        *type = getTypeFromMethodDescriptor(stackFrame->currentMethod->descriptor, index, stackFrame->currentMethod->flags & METHOD_ACC_STATIC);
     return *(double_cell_t *) (stackFrame->localVariableBase + index);
 }
 

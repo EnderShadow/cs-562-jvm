@@ -6,11 +6,15 @@
 #include "mm.h"
 #include "opcodes.h"
 #include "gc.h"
+#include "flags.h"
+#include "utils.h"
+#include "classloader.h"
 #include <math.h>
+#include <string.h>
+#include <stdio.h>
 
 int run(bc_interpreter_t *interpreter) {
-    // safeguard in case I need to make an actual interpreter struct
-    jthread_t *jthread = interpreter;
+    jthread_t *jthread = interpreter->jthread;
     
     while(true) {
         // allows garbage collection to occur
@@ -19,15 +23,17 @@ int run(bc_interpreter_t *interpreter) {
         uint8_t *bytecode = jthread->pc;
         uint8_t opcode = bytecode[0];
         
-        int ret = instr_table[opcode](jthread, false);
+        int ret = instr_table[opcode](interpreter, false);
         if(ret > 0) {
             jthread->pc += ret;
         }
         else if(ret == -EJUST_RETURNED) {
-            // TODO check if we returned from the root of the thread
+            if(!interpreter->jthread->currentStackFrame)
+                return 0;
         }
         else if(ret == -ETHREW_OFF_THREAD) {
-            // TODO print exception and kill thread
+            // TODO print exception
+            return 1;
         }
     }
     
@@ -52,6 +58,8 @@ int32_t readIntOperand(jthread_t *jthread, int offset) {
     return value;
 }
 
+bool initializeClass(bc_interpreter_t *interpreter, class_t *class);
+
 /**
  * used for throwing exceptions that were not caused by the throw instruction
  * @param interpreter
@@ -59,10 +67,137 @@ int32_t readIntOperand(jthread_t *jthread, int offset) {
  * @param exceptionMessage
  */
 void throwException(bc_interpreter_t *interpreter, char *exceptionClassName, char *exceptionMessage) {
-    // TODO
+    class_t *exceptionClass = loadClass(exceptionClassName);
+    if(!exceptionClass) {
+        printf("OutOfMemoryError: Failed to load an internal exception class\n");
+        exit(1);
+    }
+    bool initialized = initializeClass(interpreter, exceptionClass);
+    if(!initialized) {
+        printf("InternalError: Failed to initialize an internal exception class\n");
+        exit(1);
+    }
+    slot_t exceptionSlot = newObject(exceptionClass);
+    if(!exceptionSlot) {
+        printf("OutOfMemoryError: Failed to allocate an instance of an internal exception class\n");
+        exit(1);
+    }
+    slot_t messageSlot = convertToJavaString(exceptionMessage);
+    
+    // TODO call <init>(Ljava/lang/String;)V instead
+    
+    for(int i = 0; i < exceptionClass->numFields; ++i) {
+        field_t *field = exceptionClass->fields + i;
+        if(!(field->flags & FIELD_ACC_STATIC) && strcmp(field->descriptor, "Ljava/lang/String;") == 0) {
+            *(slot_t *) ((void *) getObject(exceptionSlot) + field->objectOffset) = messageSlot;
+            break;
+        }
+    }
+    
+    interpreter->exception = getObject(exceptionSlot);
 }
 
-int handle_instr_xload(jthread_t *jthread, bool wide, uint8_t type) {
+bool initializeClass(bc_interpreter_t *interpreter, class_t *class) {
+    if(!class)
+        return true;
+    
+    // If we're in the middle of loading the class in this thread, treat the class as loaded
+    if(class->status == CLASS_STATUS_INITIALIZING && class->jlock.owner == interpreter->jthread->id)
+        return true;
+    
+    // busy loop to wait for the class to be loaded if another thread is loading it
+    while(class->status == CLASS_STATUS_INITIALIZING);
+    if(class->status == CLASS_STATUS_INITIALIZED)
+        return true;
+    
+    jlock_lock(interpreter->jthread->id, &class->jlock);
+    if(class->status == CLASS_STATUS_INITIALIZED) {
+        jlock_unlock(interpreter->jthread->id, &class->jlock);
+        return true;
+    }
+    
+    class->status = CLASS_STATUS_INITIALIZING;
+    
+    if(!initializeClass(class->superClass)) {
+        class->status = CLASS_STATUS_LOADED;
+        jlock_unlock(interpreter->jthread->id, &class->jlock);
+        return false;
+    }
+    
+    for(int i = 0; i < class->numFields; ++i) {
+        field_t *field = class->fields + i;
+        if((field->flags & FIELD_ACC_STATIC)) {
+            for(int j = 0; j < field->numAttributes; ++j) {
+                attribute_info_t *attr = field->attributes[j];
+                if(strcmp(attr->constantValueAttribute.name, "ConstantValue") == 0) {
+                    uint16_t index = attr->constantValueAttribute.constantIndex;
+                    constant_info_t *constant = class->constantPool[index];
+                    uint8_t tag = constant->longDoubleInfo.tag;
+                    if(tag == CONSTANT_Integer || tag == CONSTANT_Float)
+                        *(uint32_t *) (class->staticFieldData + field->objectOffset) = constant->integerFloatInfo.bytes;
+                    else if(tag == CONSTANT_Long || tag == CONSTANT_Double)
+                        *(uint64_t *) (class->staticFieldData + field->objectOffset) = constant->longDoubleInfo.bytes;
+                    else if(tag == CONSTANT_String) {
+                        uint16_t stringIndex = constant->stringInfo.stringIndex;
+                        utf8_info_t *utfInfo = &class->constantPool[stringIndex]->utf8Info;
+                        slot_t slot = convertToJavaString(utfInfo->chars);
+                        if(slot == 0) {
+                            class->status = CLASS_STATUS_LOADED;
+                            throwException(interpreter, "java/lang/ExceptionInInitializerError", "Failed to load string constant");
+                            jlock_unlock(interpreter->jthread->id, &class->jlock);
+                            return false;
+                        }
+                        *(slot_t *) (class->staticFieldData + field->objectOffset) = slot;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    
+    method_t *clinit = NULL;
+    for(int i = 0; i < class->numMethods; ++i) {
+        method_t *method = class->methods + i;
+        if((method->flags & METHOD_ACC_STATIC) && strcmp(method->name, "<clinit>") == 0 && strcmp(method->descriptor, "()V") == 0) {
+            clinit = method;
+            break;
+        }
+    }
+    if(!clinit) {
+        class->status = CLASS_STATUS_INITIALIZED;
+        jlock_unlock(interpreter->jthread->id, &class->jlock);
+        return true;
+    }
+    
+    jthread_t *jthread = interpreter->jthread;
+    stack_frame_t *currentFrame = jthread->currentStackFrame;
+    void *currentPC = jthread->pc;
+    stack_frame_t clinitFrame;
+    clinitFrame.currentMethod = clinit;
+    clinitFrame.previousStackFrame = NULL;
+    clinitFrame.prevFramePC = NULL;
+    clinitFrame.topOfStack = 0;
+    clinitFrame.localVariableBase = currentFrame->operandStackBase + currentFrame->topOfStack;
+    clinitFrame.operandStackTypeBase = (void *) (clinitFrame.localVariableBase + clinit->codeAttribute->maxLocals);
+    clinitFrame.operandStackBase = (void *) (clinitFrame.operandStackTypeBase + clinit->codeAttribute->maxStack);
+    jthread->currentStackFrame = &clinitFrame;
+    jthread->pc = clinit->codeAttribute->code;
+    
+    int result = run(interpreter);
+    jthread->currentStackFrame = currentFrame;
+    jthread->pc = currentPC;
+    if(result) {
+        class->status = CLASS_STATUS_LOADED;
+        jlock_unlock(interpreter->jthread->id, &class->jlock);
+        return false;
+    }
+    class->status = CLASS_STATUS_INITIALIZED;
+    jlock_unlock(interpreter->jthread->id, &class->jlock);
+    return true;
+}
+
+int handle_instr_xload(bc_interpreter_t *interpreter, bool wide, uint8_t type) {
+    jthread_t *jthread = interpreter->jthread;
     uint16_t index;
     if(wide)
         index = readShortOperand(jthread, 2);
@@ -75,7 +210,8 @@ int handle_instr_xload(jthread_t *jthread, bool wide, uint8_t type) {
     return wide ? 4 : 2;
 }
 
-int handle_instr_xstore(jthread_t *jthread, bool wide) {
+int handle_instr_xstore(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     uint16_t index;
     if(wide)
         index = readShortOperand(jthread, 2);
@@ -89,7 +225,8 @@ int handle_instr_xstore(jthread_t *jthread, bool wide) {
     return wide ? 4 : 2;
 }
 
-int handle_instr_xload_n(jthread_t *jthread, uint16_t index, uint8_t type) {
+int handle_instr_xload_n(bc_interpreter_t *interpreter, uint16_t index, uint8_t type) {
+    jthread_t *jthread = interpreter->jthread;
     if(type == TYPE_LONG || type == TYPE_DOUBLE)
         pushOperand2(jthread->currentStackFrame, readLocal2(jthread->currentStackFrame, index, NULL), type);
     else
@@ -97,7 +234,8 @@ int handle_instr_xload_n(jthread_t *jthread, uint16_t index, uint8_t type) {
     return 1;
 }
 
-int handle_instr_xstore_n(jthread_t *jthread, uint16_t index) {
+int handle_instr_xstore_n(bc_interpreter_t *interpreter, uint16_t index) {
+    jthread_t *jthread = interpreter->jthread;
     uint8_t type = peekOperandType(jthread->currentStackFrame, index);
     if(type == TYPE_LONG || type == TYPE_DOUBLE)
         writeLocal2(jthread->currentStackFrame, index, popOperand2(jthread->currentStackFrame, NULL), type);
@@ -106,17 +244,18 @@ int handle_instr_xstore_n(jthread_t *jthread, uint16_t index) {
     return 1;
 }
 
-int handle_instr_xaload(jthread_t *jthread) {
+int handle_instr_xaload(bc_interpreter_t *interpreter) {
+    jthread_t *jthread = interpreter->jthread;
     int32_t index = popOperand(jthread->currentStackFrame, NULL).i;
     slot_t slot = popOperand(jthread->currentStackFrame, NULL).a;
-    array_object_t *obj = (array_object_t *) getObject(slot);
+    object_t *obj = getObject(slot);
     
     if(!obj) {
-        throwException(jthread, "java/lang/NullPointerException", "Array was null");
+        throwException(interpreter, "java/lang/NullPointerException", "Array was null");
         return 0;
     }
     if(index < 0 || index >= obj->length) {
-        throwException(jthread, "java/lang/ArrayIndexOutOfBoundsException", "index was out of bounds for the array");
+        throwException(interpreter, "java/lang/ArrayIndexOutOfBoundsException", "index was out of bounds for the array");
         return 0;
     }
     
@@ -132,20 +271,21 @@ int handle_instr_xaload(jthread_t *jthread) {
     return 1;
 }
 
-int handle_instr_xastore(jthread_t *jthread) {
+int handle_instr_xastore(bc_interpreter_t *interpreter) {
+    jthread_t *jthread = interpreter->jthread;
     uint8_t type = peekOperandType(jthread->currentStackFrame, 0);
     if(type == TYPE_LONG || type == TYPE_DOUBLE) {
         double_cell_t value = popOperand2(jthread->currentStackFrame, NULL);
         int32_t index = popOperand(jthread->currentStackFrame, NULL).i;
         slot_t slot = popOperand(jthread->currentStackFrame, NULL).a;
-        array_object_t *obj = (array_object_t *) getObject(slot);
+        object_t *obj = getObject(slot);
     
         if(!obj) {
-            throwException(jthread, "java/lang/NullPointerException", "Array was null");
+            throwException(interpreter, "java/lang/NullPointerException", "Array was null");
             return 0;
         }
         if(index < 0 || index >= obj->length) {
-            throwException(jthread, "java/lang/ArrayIndexOutOfBoundsException", "index was out of bounds for the array");
+            throwException(interpreter, "java/lang/ArrayIndexOutOfBoundsException", "index was out of bounds for the array");
             return 0;
         }
     
@@ -155,14 +295,14 @@ int handle_instr_xastore(jthread_t *jthread) {
         cell_t value = popOperand(jthread->currentStackFrame, NULL);
         int32_t index = popOperand(jthread->currentStackFrame, NULL).i;
         slot_t slot = popOperand(jthread->currentStackFrame, NULL).a;
-        array_object_t *obj = (array_object_t *) getObject(slot);
+        object_t *obj = getObject(slot);
     
         if(!obj) {
-            throwException(jthread, "java/lang/NullPointerException", "Array was null");
+            throwException(interpreter, "java/lang/NullPointerException", "Array was null");
             return 0;
         }
         if(index < 0 || index >= obj->length) {
-            throwException(jthread, "java/lang/ArrayIndexOutOfBoundsException", "index was out of bounds for the array");
+            throwException(interpreter, "java/lang/ArrayIndexOutOfBoundsException", "index was out of bounds for the array");
             return 0;
         }
     
@@ -171,418 +311,482 @@ int handle_instr_xastore(jthread_t *jthread) {
     return 1;
 }
 
-int handle_instr_unknown(jthread_t *jthread, bool wide) {
-    throwException(jthread, "java/lang/InternalError", "Unimplemented Instruction");
+int handle_instr_unknown(bc_interpreter_t *interpreter, bool wide) {
+    throwException(interpreter, "java/lang/InternalError", "Unimplemented Instruction");
     return 0;
 }
 
-int handle_instr_nop(jthread_t *jthread, bool wide) {
+int handle_instr_nop(bc_interpreter_t *interpreter, bool wide) {
 	return 1;
 }
 
-int handle_instr_aconst_null(jthread_t *jthread, bool wide) {
+int handle_instr_aconst_null(bc_interpreter_t *interpreter, bool wide) {
     cell_t cell = {.a = 0};
-	pushOperand(jthread->currentStackFrame, cell, TYPE_REFERENCE);
+	pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_REFERENCE);
 	return 1;
 }
 
-int handle_instr_iconst_m1(jthread_t *jthread, bool wide) {
+int handle_instr_iconst_m1(bc_interpreter_t *interpreter, bool wide) {
     cell_t cell = {.i = -1};
-    pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
+    pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_INT);
     return 1;
 }
 
-int handle_instr_iconst_0(jthread_t *jthread, bool wide) {
+int handle_instr_iconst_0(bc_interpreter_t *interpreter, bool wide) {
     cell_t cell = {.i = 0};
-    pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
+    pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_INT);
     return 1;
 }
 
-int handle_instr_iconst_1(jthread_t *jthread, bool wide) {
+int handle_instr_iconst_1(bc_interpreter_t *interpreter, bool wide) {
     cell_t cell = {.i = 1};
-    pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
+    pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_INT);
     return 1;
 }
 
-int handle_instr_iconst_2(jthread_t *jthread, bool wide) {
+int handle_instr_iconst_2(bc_interpreter_t *interpreter, bool wide) {
     cell_t cell = {.i = 2};
-    pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
+    pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_INT);
     return 1;
 }
 
-int handle_instr_iconst_3(jthread_t *jthread, bool wide) {
+int handle_instr_iconst_3(bc_interpreter_t *interpreter, bool wide) {
     cell_t cell = {.i = 3};
-    pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
+    pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_INT);
     return 1;
 }
 
-int handle_instr_iconst_4(jthread_t *jthread, bool wide) {
+int handle_instr_iconst_4(bc_interpreter_t *interpreter, bool wide) {
     cell_t cell = {.i = 4};
-    pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
+    pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_INT);
     return 1;
 }
 
-int handle_instr_iconst_5(jthread_t *jthread, bool wide) {
+int handle_instr_iconst_5(bc_interpreter_t *interpreter, bool wide) {
     cell_t cell = {.i = 5};
-    pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
+    pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_INT);
     return 1;
 }
 
-int handle_instr_lconst_0(jthread_t *jthread, bool wide) {
+int handle_instr_lconst_0(bc_interpreter_t *interpreter, bool wide) {
     double_cell_t cell = {.l = 0};
-    pushOperand2(jthread->currentStackFrame, cell, TYPE_LONG);
+    pushOperand2(interpreter->jthread->currentStackFrame, cell, TYPE_LONG);
     return 1;
 }
 
-int handle_instr_lconst_1(jthread_t *jthread, bool wide) {
+int handle_instr_lconst_1(bc_interpreter_t *interpreter, bool wide) {
     double_cell_t cell = {.l = 1};
-    pushOperand2(jthread->currentStackFrame, cell, TYPE_LONG);
+    pushOperand2(interpreter->jthread->currentStackFrame, cell, TYPE_LONG);
     return 1;
 }
 
-int handle_instr_fconst_0(jthread_t *jthread, bool wide) {
+int handle_instr_fconst_0(bc_interpreter_t *interpreter, bool wide) {
     cell_t cell = {.f = 0.0f};
-    pushOperand(jthread->currentStackFrame, cell, TYPE_FLOAT);
+    pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_FLOAT);
     return 1;
 }
 
-int handle_instr_fconst_1(jthread_t *jthread, bool wide) {
+int handle_instr_fconst_1(bc_interpreter_t *interpreter, bool wide) {
     cell_t cell = {.f = 1.0f};
-    pushOperand(jthread->currentStackFrame, cell, TYPE_FLOAT);
+    pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_FLOAT);
     return 1;
 }
 
-int handle_instr_fconst_2(jthread_t *jthread, bool wide) {
+int handle_instr_fconst_2(bc_interpreter_t *interpreter, bool wide) {
     cell_t cell = {.f = 2.0f};
-    pushOperand(jthread->currentStackFrame, cell, TYPE_FLOAT);
+    pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_FLOAT);
     return 1;
 }
 
-int handle_instr_dconst_0(jthread_t *jthread, bool wide) {
+int handle_instr_dconst_0(bc_interpreter_t *interpreter, bool wide) {
     double_cell_t cell = {.d = 0.0};
-    pushOperand2(jthread->currentStackFrame, cell, TYPE_DOUBLE);
+    pushOperand2(interpreter->jthread->currentStackFrame, cell, TYPE_DOUBLE);
     return 1;
 }
 
-int handle_instr_dconst_1(jthread_t *jthread, bool wide) {
+int handle_instr_dconst_1(bc_interpreter_t *interpreter, bool wide) {
     double_cell_t cell = {.d = 1.0};
-    pushOperand2(jthread->currentStackFrame, cell, TYPE_DOUBLE);
+    pushOperand2(interpreter->jthread->currentStackFrame, cell, TYPE_DOUBLE);
     return 1;
 }
 
-int handle_instr_bipush(jthread_t *jthread, bool wide) {
+int handle_instr_bipush(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	cell_t cell;
 	cell.i = readByteOperand(jthread, 1);
 	pushOperand(jthread->currentStackFrame, cell, TYPE_BYTE);
 	return 2;
 }
 
-int handle_instr_sipush(jthread_t *jthread, bool wide) {
+int handle_instr_sipush(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t cell;
     cell.i = readShortOperand(jthread, 1);
     pushOperand(jthread->currentStackFrame, cell, TYPE_SHORT);
     return 3;
 }
 
-int handle_instr_ldc(jthread_t *jthread, bool wide) {
-	uint8_t index = readByteOperand(jthread, 1);
-	// TODO
-	return -1;
+int handle_instr_ldc(bc_interpreter_t *interpreter, bool wide) {
+	uint8_t index = readByteOperand(interpreter->jthread, 1);
+	constant_info_t *constant = interpreter->jthread->currentStackFrame->currentMethod->class->constantPool[index];
+	uint8_t tag = constant->integerFloatInfo.tag;
+	cell_t cell;
+	if(tag == CONSTANT_Integer) {
+	    cell.a = constant->integerFloatInfo.bytes;
+	    pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_INT);
+	}
+	else if(tag == CONSTANT_Float) {
+        cell.a = constant->integerFloatInfo.bytes;
+        pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_FLOAT);
+	}
+	else if(tag == CONSTANT_String) {
+	    uint16_t stringIndex = constant->stringInfo.stringIndex;
+	    char *characters = interpreter->jthread->currentStackFrame->currentMethod->class->constantPool[stringIndex]->utf8Info.chars;
+        cell.a = convertToJavaString(characters);
+        if(!cell.a) {
+            throwException(interpreter, "java/lang/OutOfMemoryError", "Failed to load string from constant pool");
+            return 0;
+        }
+        pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_REFERENCE);
+	}
+    else {
+        // TODO implement remaining constants
+        throwException(interpreter, "java/lang/InternalError", "Unsupported ldc constant");
+        return 0;
+    }
+	return 2;
+}
+
+int handle_instr_ldc_w(bc_interpreter_t *interpreter, bool wide) {
+    uint16_t index = readShortOperand(interpreter->jthread, 1);
+    constant_info_t *constant = interpreter->jthread->currentStackFrame->currentMethod->class->constantPool[index];
+    uint8_t tag = constant->integerFloatInfo.tag;
+    cell_t cell;
+    if(tag == CONSTANT_Integer) {
+        cell.a = constant->integerFloatInfo.bytes;
+        pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_INT);
+    }
+    else if(tag == CONSTANT_Float) {
+        cell.a = constant->integerFloatInfo.bytes;
+        pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_FLOAT);
+    }
+    else if(tag == CONSTANT_String) {
+        uint16_t stringIndex = constant->stringInfo.stringIndex;
+        char *characters = interpreter->jthread->currentStackFrame->currentMethod->class->constantPool[stringIndex]->utf8Info.chars;
+        cell.a = convertToJavaString(characters);
+        if(!cell.a) {
+            throwException(interpreter, "java/lang/OutOfMemoryError", "Failed to load string from constant pool");
+            return 0;
+        }
+        pushOperand(interpreter->jthread->currentStackFrame, cell, TYPE_REFERENCE);
+    }
+    else {
+        // TODO implement remaining constants
+        throwException(interpreter, "java/lang/InternalError", "Unsupported ldc constant");
+        return 0;
+    }
+    return 3;
 }
 
-int handle_instr_ldc_w(jthread_t *jthread, bool wide) {
-    uint16_t index = readShortOperand(jthread, 1);
-    // TODO
-    return -1;
+int handle_instr_ldc2_w(bc_interpreter_t *interpreter, bool wide) {
+    uint16_t index = readShortOperand(interpreter->jthread, 1);
+    constant_info_t *constant = interpreter->jthread->currentStackFrame->currentMethod->class->constantPool[index];
+    uint8_t tag = constant->longDoubleInfo.tag;
+    double_cell_t cell;
+    if(tag == CONSTANT_Long) {
+        cell.l = constant->longDoubleInfo.bytes;
+        pushOperand2(interpreter->jthread->currentStackFrame, cell, TYPE_LONG);
+    }
+    else if(tag == CONSTANT_Double) {
+        cell.l = constant->longDoubleInfo.bytes;
+        pushOperand2(interpreter->jthread->currentStackFrame, cell, TYPE_DOUBLE);
+    }
+    return 3;
 }
 
-int handle_instr_ldc2_w(jthread_t *jthread, bool wide) {
-    uint16_t index = readShortOperand(jthread, 1);
-    // TODO
-    return -1;
+int handle_instr_iload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload(interpreter, wide, TYPE_INT);
 }
 
-int handle_instr_iload(jthread_t *jthread, bool wide) {
-    return handle_instr_xload(jthread, wide, TYPE_INT);
+int handle_instr_lload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload(interpreter, wide, TYPE_LONG);
 }
 
-int handle_instr_lload(jthread_t *jthread, bool wide) {
-    return handle_instr_xload(jthread, wide, TYPE_LONG);
+int handle_instr_fload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload(interpreter, wide, TYPE_FLOAT);
 }
 
-int handle_instr_fload(jthread_t *jthread, bool wide) {
-    return handle_instr_xload(jthread, wide, TYPE_FLOAT);
+int handle_instr_dload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload(interpreter, wide, TYPE_DOUBLE);
 }
 
-int handle_instr_dload(jthread_t *jthread, bool wide) {
-    return handle_instr_xload(jthread, wide, TYPE_DOUBLE);
+int handle_instr_aload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload(interpreter, wide, TYPE_REFERENCE);
 }
 
-int handle_instr_aload(jthread_t *jthread, bool wide) {
-    return handle_instr_xload(jthread, wide, TYPE_REFERENCE);
+int handle_instr_iload_0(bc_interpreter_t *interpreter, bool wide) {
+	return handle_instr_xload_n(interpreter, 0, TYPE_INT);
 }
 
-int handle_instr_iload_0(jthread_t *jthread, bool wide) {
-	return handle_instr_xload_n(jthread, 0, TYPE_INT);
+int handle_instr_iload_1(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 1, TYPE_INT);
 }
 
-int handle_instr_iload_1(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 1, TYPE_INT);
+int handle_instr_iload_2(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 2, TYPE_INT);
 }
 
-int handle_instr_iload_2(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 2, TYPE_INT);
+int handle_instr_iload_3(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 3, TYPE_INT);
 }
 
-int handle_instr_iload_3(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 3, TYPE_INT);
+int handle_instr_lload_0(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 0, TYPE_LONG);
 }
 
-int handle_instr_lload_0(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 0, TYPE_LONG);
+int handle_instr_lload_1(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 1, TYPE_LONG);
 }
 
-int handle_instr_lload_1(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 1, TYPE_LONG);
+int handle_instr_lload_2(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 2, TYPE_LONG);
 }
 
-int handle_instr_lload_2(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 2, TYPE_LONG);
+int handle_instr_lload_3(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 3, TYPE_LONG);
 }
 
-int handle_instr_lload_3(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 3, TYPE_LONG);
+int handle_instr_fload_0(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 0, TYPE_FLOAT);
 }
 
-int handle_instr_fload_0(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 0, TYPE_FLOAT);
+int handle_instr_fload_1(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 1, TYPE_FLOAT);
 }
 
-int handle_instr_fload_1(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 1, TYPE_FLOAT);
+int handle_instr_fload_2(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 2, TYPE_FLOAT);
 }
 
-int handle_instr_fload_2(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 2, TYPE_FLOAT);
+int handle_instr_fload_3(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 3, TYPE_FLOAT);
 }
 
-int handle_instr_fload_3(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 3, TYPE_FLOAT);
+int handle_instr_dload_0(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 0, TYPE_DOUBLE);
 }
 
-int handle_instr_dload_0(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 0, TYPE_DOUBLE);
+int handle_instr_dload_1(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 1, TYPE_DOUBLE);
 }
 
-int handle_instr_dload_1(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 1, TYPE_DOUBLE);
+int handle_instr_dload_2(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 2, TYPE_DOUBLE);
 }
 
-int handle_instr_dload_2(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 2, TYPE_DOUBLE);
+int handle_instr_dload_3(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 3, TYPE_DOUBLE);
 }
 
-int handle_instr_dload_3(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 3, TYPE_DOUBLE);
+int handle_instr_aload_0(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 0, TYPE_REFERENCE);
 }
 
-int handle_instr_aload_0(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 0, TYPE_REFERENCE);
+int handle_instr_aload_1(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 1, TYPE_REFERENCE);
 }
 
-int handle_instr_aload_1(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 1, TYPE_REFERENCE);
+int handle_instr_aload_2(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 2, TYPE_REFERENCE);
 }
 
-int handle_instr_aload_2(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 2, TYPE_REFERENCE);
+int handle_instr_aload_3(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xload_n(interpreter, 3, TYPE_REFERENCE);
 }
 
-int handle_instr_aload_3(jthread_t *jthread, bool wide) {
-    return handle_instr_xload_n(jthread, 3, TYPE_REFERENCE);
+int handle_instr_iaload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xaload(interpreter);
 }
 
-int handle_instr_iaload(jthread_t *jthread, bool wide) {
-    return handle_instr_xaload(jthread);
+int handle_instr_laload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xaload(interpreter);
 }
 
-int handle_instr_laload(jthread_t *jthread, bool wide) {
-    return handle_instr_xaload(jthread);
+int handle_instr_faload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xaload(interpreter);
 }
 
-int handle_instr_faload(jthread_t *jthread, bool wide) {
-    return handle_instr_xaload(jthread);
+int handle_instr_daload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xaload(interpreter);
 }
 
-int handle_instr_daload(jthread_t *jthread, bool wide) {
-    return handle_instr_xaload(jthread);
+int handle_instr_aaload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xaload(interpreter);
 }
 
-int handle_instr_aaload(jthread_t *jthread, bool wide) {
-    return handle_instr_xaload(jthread);
+int handle_instr_baload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xaload(interpreter);
 }
 
-int handle_instr_baload(jthread_t *jthread, bool wide) {
-    return handle_instr_xaload(jthread);
+int handle_instr_caload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xaload(interpreter);
 }
 
-int handle_instr_caload(jthread_t *jthread, bool wide) {
-    return handle_instr_xaload(jthread);
+int handle_instr_saload(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xaload(interpreter);
 }
 
-int handle_instr_saload(jthread_t *jthread, bool wide) {
-    return handle_instr_xaload(jthread);
+int handle_instr_istore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore(interpreter, wide);
 }
 
-int handle_instr_istore(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore(jthread, wide);
+int handle_instr_lstore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore(interpreter, wide);
 }
 
-int handle_instr_lstore(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore(jthread, wide);
+int handle_instr_fstore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore(interpreter, wide);
 }
 
-int handle_instr_fstore(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore(jthread, wide);
+int handle_instr_dstore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore(interpreter, wide);
 }
 
-int handle_instr_dstore(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore(jthread, wide);
+int handle_instr_astore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore(interpreter, wide);
 }
 
-int handle_instr_astore(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore(jthread, wide);
+int handle_instr_istore_0(bc_interpreter_t *interpreter, bool wide) {
+	return handle_instr_xstore_n(interpreter, 0);
 }
 
-int handle_instr_istore_0(jthread_t *jthread, bool wide) {
-	return handle_instr_xstore_n(jthread, 0);
+int handle_instr_istore_1(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 1);
 }
 
-int handle_instr_istore_1(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 1);
+int handle_instr_istore_2(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 2);
 }
 
-int handle_instr_istore_2(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 2);
+int handle_instr_istore_3(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 3);
 }
 
-int handle_instr_istore_3(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 3);
+int handle_instr_lstore_0(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 0);
 }
 
-int handle_instr_lstore_0(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 0);
+int handle_instr_lstore_1(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 1);
 }
 
-int handle_instr_lstore_1(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 1);
+int handle_instr_lstore_2(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 2);
 }
 
-int handle_instr_lstore_2(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 2);
+int handle_instr_lstore_3(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 3);
 }
 
-int handle_instr_lstore_3(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 3);
+int handle_instr_fstore_0(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 0);
 }
 
-int handle_instr_fstore_0(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 0);
+int handle_instr_fstore_1(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 1);
 }
 
-int handle_instr_fstore_1(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 1);
+int handle_instr_fstore_2(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 2);
 }
 
-int handle_instr_fstore_2(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 2);
+int handle_instr_fstore_3(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 3);
 }
 
-int handle_instr_fstore_3(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 3);
+int handle_instr_dstore_0(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 0);
 }
 
-int handle_instr_dstore_0(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 0);
+int handle_instr_dstore_1(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 1);
 }
 
-int handle_instr_dstore_1(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 1);
+int handle_instr_dstore_2(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 2);
 }
 
-int handle_instr_dstore_2(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 2);
+int handle_instr_dstore_3(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 3);
 }
 
-int handle_instr_dstore_3(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 3);
+int handle_instr_astore_0(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 0);
 }
 
-int handle_instr_astore_0(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 0);
+int handle_instr_astore_1(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 1);
 }
 
-int handle_instr_astore_1(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 1);
+int handle_instr_astore_2(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 2);
 }
 
-int handle_instr_astore_2(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 2);
+int handle_instr_astore_3(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xstore_n(interpreter, 3);
 }
 
-int handle_instr_astore_3(jthread_t *jthread, bool wide) {
-    return handle_instr_xstore_n(jthread, 3);
+int handle_instr_iastore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xastore(interpreter);
 }
 
-int handle_instr_iastore(jthread_t *jthread, bool wide) {
-    return handle_instr_xastore(jthread);
+int handle_instr_lastore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xastore(interpreter);
 }
 
-int handle_instr_lastore(jthread_t *jthread, bool wide) {
-    return handle_instr_xastore(jthread);
+int handle_instr_fastore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xastore(interpreter);
 }
 
-int handle_instr_fastore(jthread_t *jthread, bool wide) {
-    return handle_instr_xastore(jthread);
+int handle_instr_dastore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xastore(interpreter);
 }
 
-int handle_instr_dastore(jthread_t *jthread, bool wide) {
-    return handle_instr_xastore(jthread);
+int handle_instr_aastore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xastore(interpreter);
 }
 
-int handle_instr_aastore(jthread_t *jthread, bool wide) {
-    return handle_instr_xastore(jthread);
+int handle_instr_bastore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xastore(interpreter);
 }
 
-int handle_instr_bastore(jthread_t *jthread, bool wide) {
-    return handle_instr_xastore(jthread);
+int handle_instr_castore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xastore(interpreter);
 }
 
-int handle_instr_castore(jthread_t *jthread, bool wide) {
-    return handle_instr_xastore(jthread);
+int handle_instr_sastore(bc_interpreter_t *interpreter, bool wide) {
+    return handle_instr_xastore(interpreter);
 }
 
-int handle_instr_sastore(jthread_t *jthread, bool wide) {
-    return handle_instr_xastore(jthread);
-}
-
-int handle_instr_pop(jthread_t *jthread, bool wide) {
-	--jthread->currentStackFrame->topOfStack;
+int handle_instr_pop(bc_interpreter_t *interpreter, bool wide) {
+	--interpreter->jthread->currentStackFrame->topOfStack;
 	return 1;
 }
 
-int handle_instr_pop2(jthread_t *jthread, bool wide) {
-    jthread->currentStackFrame->topOfStack -= 2;
+int handle_instr_pop2(bc_interpreter_t *interpreter, bool wide) {
+    interpreter->jthread->currentStackFrame->topOfStack -= 2;
     return 1;
 }
 
-int handle_instr_dup(jthread_t *jthread, bool wide) {
+int handle_instr_dup(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     uint8_t tosType;
 	pushOperand(jthread->currentStackFrame, peekOperand(jthread->currentStackFrame, 0, &tosType), tosType);
 	return 1;
 }
 
-int handle_instr_dup_x1(jthread_t *jthread, bool wide) {
+int handle_instr_dup_x1(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     uint8_t tosType;
     uint8_t nextType;
 	cell_t top = popOperand(jthread->currentStackFrame, &tosType);
@@ -593,7 +797,8 @@ int handle_instr_dup_x1(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_dup_x2(jthread_t *jthread, bool wide) {
+int handle_instr_dup_x2(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     uint8_t tosType;
     uint8_t nextType;
     uint8_t next2Type;
@@ -607,7 +812,8 @@ int handle_instr_dup_x2(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_dup2(jthread_t *jthread, bool wide) {
+int handle_instr_dup2(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     uint8_t tosType;
     uint8_t nextType;
     pushOperand(jthread->currentStackFrame, peekOperand(jthread->currentStackFrame, 1, &nextType), nextType);
@@ -615,7 +821,8 @@ int handle_instr_dup2(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_dup2_x1(jthread_t *jthread, bool wide) {
+int handle_instr_dup2_x1(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	uint8_t tosType;
 	uint8_t nextType;
     uint8_t next2Type;
@@ -630,7 +837,8 @@ int handle_instr_dup2_x1(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_dup2_x2(jthread_t *jthread, bool wide) {
+int handle_instr_dup2_x2(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     uint8_t tosType;
     uint8_t nextType;
     uint8_t nextType2;
@@ -648,7 +856,8 @@ int handle_instr_dup2_x2(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_swap(jthread_t *jthread, bool wide) {
+int handle_instr_swap(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     uint8_t tosType;
     uint8_t nextType;
     cell_t top = popOperand(jthread->currentStackFrame, &tosType);
@@ -658,7 +867,8 @@ int handle_instr_swap(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_iadd(jthread_t *jthread, bool wide) {
+int handle_instr_iadd(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	cell_t top = popOperand(jthread->currentStackFrame, NULL);
 	cell_t next = popOperand(jthread->currentStackFrame, NULL);
 	top.i += next.i;
@@ -666,7 +876,8 @@ int handle_instr_iadd(jthread_t *jthread, bool wide) {
 	return 1;
 }
 
-int handle_instr_ladd(jthread_t *jthread, bool wide) {
+int handle_instr_ladd(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     top.l += next.l;
@@ -674,7 +885,8 @@ int handle_instr_ladd(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_fadd(jthread_t *jthread, bool wide) {
+int handle_instr_fadd(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     top.f += next.f;
@@ -682,7 +894,8 @@ int handle_instr_fadd(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_dadd(jthread_t *jthread, bool wide) {
+int handle_instr_dadd(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     top.d += next.d;
@@ -690,7 +903,8 @@ int handle_instr_dadd(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_isub(jthread_t *jthread, bool wide) {
+int handle_instr_isub(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     next.i -= top.i;
@@ -698,7 +912,8 @@ int handle_instr_isub(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_lsub(jthread_t *jthread, bool wide) {
+int handle_instr_lsub(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     next.l -= top.l;
@@ -706,7 +921,8 @@ int handle_instr_lsub(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_fsub(jthread_t *jthread, bool wide) {
+int handle_instr_fsub(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     next.f -= top.f;
@@ -714,7 +930,8 @@ int handle_instr_fsub(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_dsub(jthread_t *jthread, bool wide) {
+int handle_instr_dsub(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     next.d -= top.d;
@@ -722,7 +939,8 @@ int handle_instr_dsub(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_imul(jthread_t *jthread, bool wide) {
+int handle_instr_imul(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     top.i *= next.i;
@@ -730,7 +948,8 @@ int handle_instr_imul(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_lmul(jthread_t *jthread, bool wide) {
+int handle_instr_lmul(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     top.l *= next.l;
@@ -738,7 +957,8 @@ int handle_instr_lmul(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_fmul(jthread_t *jthread, bool wide) {
+int handle_instr_fmul(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     top.f *= next.f;
@@ -746,7 +966,8 @@ int handle_instr_fmul(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_dmul(jthread_t *jthread, bool wide) {
+int handle_instr_dmul(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     top.d *= next.d;
@@ -754,11 +975,12 @@ int handle_instr_dmul(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_idiv(jthread_t *jthread, bool wide) {
+int handle_instr_idiv(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     if(top.i == 0) {
-        throwException(jthread, "java/lang/ArithmeticException", "Cannot divide by 0");
+        throwException(interpreter, "java/lang/ArithmeticException", "Cannot divide by 0");
         return 0;
     }
     next.i /= top.i;
@@ -766,11 +988,12 @@ int handle_instr_idiv(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_ldiv(jthread_t *jthread, bool wide) {
+int handle_instr_ldiv(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     if(top.l == 0) {
-        throwException(jthread, "java/lang/ArithmeticException", "Cannot divide by 0");
+        throwException(interpreter, "java/lang/ArithmeticException", "Cannot divide by 0");
         return 0;
     }
     next.l /= top.l;
@@ -778,7 +1001,8 @@ int handle_instr_ldiv(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_fdiv(jthread_t *jthread, bool wide) {
+int handle_instr_fdiv(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     next.f /= top.f;
@@ -786,7 +1010,8 @@ int handle_instr_fdiv(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_ddiv(jthread_t *jthread, bool wide) {
+int handle_instr_ddiv(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     next.d /= top.d;
@@ -794,11 +1019,12 @@ int handle_instr_ddiv(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_irem(jthread_t *jthread, bool wide) {
+int handle_instr_irem(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     if(top.i == 0) {
-        throwException(jthread, "java/lang/ArithmeticException", "Cannot divide by 0");
+        throwException(interpreter, "java/lang/ArithmeticException", "Cannot divide by 0");
         return 0;
     }
     next.i %= top.i;
@@ -806,11 +1032,12 @@ int handle_instr_irem(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_lrem(jthread_t *jthread, bool wide) {
+int handle_instr_lrem(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     if(top.l == 0) {
-        throwException(jthread, "java/lang/ArithmeticException", "Cannot divide by 0");
+        throwException(interpreter, "java/lang/ArithmeticException", "Cannot divide by 0");
         return 0;
     }
     next.l %= top.l;
@@ -818,7 +1045,8 @@ int handle_instr_lrem(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_frem(jthread_t *jthread, bool wide) {
+int handle_instr_frem(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     next.f = fmodf(next.f, top.f);
@@ -826,7 +1054,8 @@ int handle_instr_frem(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_drem(jthread_t *jthread, bool wide) {
+int handle_instr_drem(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     next.d = fmod(next.d, top.d);
@@ -834,35 +1063,40 @@ int handle_instr_drem(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_ineg(jthread_t *jthread, bool wide) {
+int handle_instr_ineg(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	cell_t top = popOperand(jthread->currentStackFrame, NULL);
 	top.i = -top.i;
 	pushOperand(jthread->currentStackFrame, top, TYPE_INT);
 	return 1;
 }
 
-int handle_instr_lneg(jthread_t *jthread, bool wide) {
+int handle_instr_lneg(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     top.l = -top.l;
     pushOperand2(jthread->currentStackFrame, top, TYPE_LONG);
     return 1;
 }
 
-int handle_instr_fneg(jthread_t *jthread, bool wide) {
+int handle_instr_fneg(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     top.f = -top.f;
     pushOperand(jthread->currentStackFrame, top, TYPE_FLOAT);
     return 1;
 }
 
-int handle_instr_dneg(jthread_t *jthread, bool wide) {
+int handle_instr_dneg(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     top.d = -top.d;
     pushOperand2(jthread->currentStackFrame, top, TYPE_DOUBLE);
     return 1;
 }
 
-int handle_instr_ishl(jthread_t *jthread, bool wide) {
+int handle_instr_ishl(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     next.i <<= top.i;
@@ -870,7 +1104,8 @@ int handle_instr_ishl(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_lshl(jthread_t *jthread, bool wide) {
+int handle_instr_lshl(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     next.l <<= top.i;
@@ -878,7 +1113,8 @@ int handle_instr_lshl(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_ishr(jthread_t *jthread, bool wide) {
+int handle_instr_ishr(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     next.i >>= top.i;
@@ -886,7 +1122,8 @@ int handle_instr_ishr(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_lshr(jthread_t *jthread, bool wide) {
+int handle_instr_lshr(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     next.l >>= top.i;
@@ -894,7 +1131,8 @@ int handle_instr_lshr(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_iushr(jthread_t *jthread, bool wide) {
+int handle_instr_iushr(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     next.i = ((uint32_t) next.i) >> top.i;
@@ -902,7 +1140,8 @@ int handle_instr_iushr(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_lushr(jthread_t *jthread, bool wide) {
+int handle_instr_lushr(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     next.l = ((uint64_t) next.l) >> top.i;
@@ -910,7 +1149,8 @@ int handle_instr_lushr(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_iand(jthread_t *jthread, bool wide) {
+int handle_instr_iand(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     top.i &= next.i;
@@ -918,7 +1158,8 @@ int handle_instr_iand(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_land(jthread_t *jthread, bool wide) {
+int handle_instr_land(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     top.l &= next.l;
@@ -926,7 +1167,8 @@ int handle_instr_land(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_ior(jthread_t *jthread, bool wide) {
+int handle_instr_ior(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     top.i |= next.i;
@@ -934,7 +1176,8 @@ int handle_instr_ior(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_lor(jthread_t *jthread, bool wide) {
+int handle_instr_lor(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     top.l |= next.l;
@@ -942,7 +1185,8 @@ int handle_instr_lor(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_ixor(jthread_t *jthread, bool wide) {
+int handle_instr_ixor(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     top.i ^= next.i;
@@ -950,7 +1194,8 @@ int handle_instr_ixor(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_lxor(jthread_t *jthread, bool wide) {
+int handle_instr_lxor(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     top.l ^= next.l;
@@ -958,7 +1203,8 @@ int handle_instr_lxor(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_iinc(jthread_t *jthread, bool wide) {
+int handle_instr_iinc(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	uint16_t index;
 	int16_t amt;
 	if(wide) {
@@ -975,112 +1221,128 @@ int handle_instr_iinc(jthread_t *jthread, bool wide) {
     return wide ? 6 : 3;
 }
 
-int handle_instr_i2l(jthread_t *jthread, bool wide) {
+int handle_instr_i2l(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	cell_t cell = popOperand(jthread->currentStackFrame, NULL);
 	double_cell_t dcell = {.l = cell.i};
 	pushOperand2(jthread->currentStackFrame, dcell, TYPE_LONG);
     return 1;
 }
 
-int handle_instr_i2f(jthread_t *jthread, bool wide) {
+int handle_instr_i2f(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	cell_t cell = popOperand(jthread->currentStackFrame, NULL);
 	cell.f = cell.i;
 	pushOperand(jthread->currentStackFrame, cell, TYPE_FLOAT);
     return 1;
 }
 
-int handle_instr_i2d(jthread_t *jthread, bool wide) {
+int handle_instr_i2d(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t cell = popOperand(jthread->currentStackFrame, NULL);
     double_cell_t dcell = {.d = cell.i};
     pushOperand2(jthread->currentStackFrame, dcell, TYPE_DOUBLE);
     return 1;
 }
 
-int handle_instr_l2i(jthread_t *jthread, bool wide) {
+int handle_instr_l2i(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	double_cell_t dcell = popOperand2(jthread->currentStackFrame, NULL);
 	cell_t cell = {.i = dcell.l};
 	pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
     return 1;
 }
 
-int handle_instr_l2f(jthread_t *jthread, bool wide) {
+int handle_instr_l2f(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t dcell = popOperand2(jthread->currentStackFrame, NULL);
     cell_t cell = {.f = dcell.l};
     pushOperand(jthread->currentStackFrame, cell, TYPE_FLOAT);
     return 1;
 }
 
-int handle_instr_l2d(jthread_t *jthread, bool wide) {
+int handle_instr_l2d(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t dcell = popOperand2(jthread->currentStackFrame, NULL);
     dcell.d = dcell.l;
     pushOperand2(jthread->currentStackFrame, dcell, TYPE_INT);
     return 1;
 }
 
-int handle_instr_f2i(jthread_t *jthread, bool wide) {
+int handle_instr_f2i(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t cell = popOperand(jthread->currentStackFrame, NULL);
     cell.i = cell.f;
     pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
     return 1;
 }
 
-int handle_instr_f2l(jthread_t *jthread, bool wide) {
+int handle_instr_f2l(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t cell = popOperand(jthread->currentStackFrame, NULL);
     double_cell_t dcell = {.l = cell.f};
     pushOperand2(jthread->currentStackFrame, dcell, TYPE_LONG);
     return 1;
 }
 
-int handle_instr_f2d(jthread_t *jthread, bool wide) {
+int handle_instr_f2d(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t cell = popOperand(jthread->currentStackFrame, NULL);
     double_cell_t dcell = {.d = cell.f};
     pushOperand2(jthread->currentStackFrame, dcell, TYPE_DOUBLE);
     return 1;
 }
 
-int handle_instr_d2i(jthread_t *jthread, bool wide) {
+int handle_instr_d2i(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t dcell = popOperand2(jthread->currentStackFrame, NULL);
     cell_t cell = {.i = dcell.d};
     pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
     return 1;
 }
 
-int handle_instr_d2l(jthread_t *jthread, bool wide) {
+int handle_instr_d2l(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	double_cell_t dcell = popOperand2(jthread->currentStackFrame, NULL);
 	dcell.l = dcell.d;
 	pushOperand2(jthread->currentStackFrame, dcell, TYPE_LONG);
     return 1;
 }
 
-int handle_instr_d2f(jthread_t *jthread, bool wide) {
+int handle_instr_d2f(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t dcell = popOperand2(jthread->currentStackFrame, NULL);
     cell_t cell = {.f = dcell.d};
     pushOperand(jthread->currentStackFrame, cell, TYPE_FLOAT);
     return 1;
 }
 
-int handle_instr_i2b(jthread_t *jthread, bool wide) {
+int handle_instr_i2b(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t cell = popOperand(jthread->currentStackFrame, NULL);
     cell.i = (int8_t) cell.i;
     pushOperand(jthread->currentStackFrame, cell, TYPE_BYTE);
     return 1;
 }
 
-int handle_instr_i2c(jthread_t *jthread, bool wide) {
+int handle_instr_i2c(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t cell = popOperand(jthread->currentStackFrame, NULL);
     cell.i = cell.i & 0xFFFF;
     pushOperand(jthread->currentStackFrame, cell, TYPE_CHAR);
     return 1;
 }
 
-int handle_instr_i2s(jthread_t *jthread, bool wide) {
+int handle_instr_i2s(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t cell = popOperand(jthread->currentStackFrame, NULL);
     cell.i = (int16_t) cell.i;
     pushOperand(jthread->currentStackFrame, cell, TYPE_SHORT);
     return 1;
 }
 
-int handle_instr_lcmp(jthread_t *jthread, bool wide) {
+int handle_instr_lcmp(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     cell_t result = {.i = MAX(-1, MIN(1, next.l - top.l))};
@@ -1088,7 +1350,8 @@ int handle_instr_lcmp(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_fcmpl(jthread_t *jthread, bool wide) {
+int handle_instr_fcmpl(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	cell_t top = popOperand(jthread->currentStackFrame, NULL);
 	cell_t next = popOperand(jthread->currentStackFrame, NULL);
 	if(isnanf(top.f) || isnanf(next.f))
@@ -1103,7 +1366,8 @@ int handle_instr_fcmpl(jthread_t *jthread, bool wide) {
 	return 1;
 }
 
-int handle_instr_fcmpg(jthread_t *jthread, bool wide) {
+int handle_instr_fcmpg(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     if(isnanf(top.f) || isnanf(next.f))
@@ -1118,7 +1382,8 @@ int handle_instr_fcmpg(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_dcmpl(jthread_t *jthread, bool wide) {
+int handle_instr_dcmpl(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     cell_t result;
@@ -1134,7 +1399,8 @@ int handle_instr_dcmpl(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_dcmpg(jthread_t *jthread, bool wide) {
+int handle_instr_dcmpg(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t top = popOperand2(jthread->currentStackFrame, NULL);
     double_cell_t next = popOperand2(jthread->currentStackFrame, NULL);
     cell_t result;
@@ -1150,7 +1416,8 @@ int handle_instr_dcmpg(jthread_t *jthread, bool wide) {
     return 1;
 }
 
-int handle_instr_ifeq(jthread_t *jthread, bool wide) {
+int handle_instr_ifeq(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	cell_t top = popOperand(jthread->currentStackFrame, NULL);
 	int16_t offset = readShortOperand(jthread, 1);
 	if(top.i == 0) {
@@ -1160,7 +1427,8 @@ int handle_instr_ifeq(jthread_t *jthread, bool wide) {
 	return 3;
 }
 
-int handle_instr_ifne(jthread_t *jthread, bool wide) {
+int handle_instr_ifne(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
     if(top.i != 0) {
@@ -1170,7 +1438,8 @@ int handle_instr_ifne(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_iflt(jthread_t *jthread, bool wide) {
+int handle_instr_iflt(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
     if(top.i < 0) {
@@ -1180,7 +1449,8 @@ int handle_instr_iflt(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_ifge(jthread_t *jthread, bool wide) {
+int handle_instr_ifge(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
     if(top.i >= 0) {
@@ -1190,7 +1460,8 @@ int handle_instr_ifge(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_ifgt(jthread_t *jthread, bool wide) {
+int handle_instr_ifgt(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
     if(top.i > 0) {
@@ -1200,7 +1471,8 @@ int handle_instr_ifgt(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_ifle(jthread_t *jthread, bool wide) {
+int handle_instr_ifle(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
     if(top.i <= 0) {
@@ -1210,7 +1482,8 @@ int handle_instr_ifle(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_if_icmpeq(jthread_t *jthread, bool wide) {
+int handle_instr_if_icmpeq(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
@@ -1221,7 +1494,8 @@ int handle_instr_if_icmpeq(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_if_icmpne(jthread_t *jthread, bool wide) {
+int handle_instr_if_icmpne(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
@@ -1232,7 +1506,8 @@ int handle_instr_if_icmpne(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_if_icmplt(jthread_t *jthread, bool wide) {
+int handle_instr_if_icmplt(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
@@ -1243,7 +1518,8 @@ int handle_instr_if_icmplt(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_if_icmpge(jthread_t *jthread, bool wide) {
+int handle_instr_if_icmpge(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
@@ -1254,7 +1530,8 @@ int handle_instr_if_icmpge(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_if_icmpgt(jthread_t *jthread, bool wide) {
+int handle_instr_if_icmpgt(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
@@ -1265,7 +1542,8 @@ int handle_instr_if_icmpgt(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_if_icmple(jthread_t *jthread, bool wide) {
+int handle_instr_if_icmple(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
@@ -1276,7 +1554,8 @@ int handle_instr_if_icmple(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_if_acmpeq(jthread_t *jthread, bool wide) {
+int handle_instr_if_acmpeq(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
@@ -1287,7 +1566,8 @@ int handle_instr_if_acmpeq(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_if_acmpne(jthread_t *jthread, bool wide) {
+int handle_instr_if_acmpne(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     cell_t next = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
@@ -1298,32 +1578,36 @@ int handle_instr_if_acmpne(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_goto(jthread_t *jthread, bool wide) {
+int handle_instr_goto(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     int16_t offset = readShortOperand(jthread, 1);
     jthread->pc += offset;
     return 0;
 }
 
-int handle_instr_jsr(jthread_t *jthread, bool wide) {
+int handle_instr_jsr(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     int16_t offset = readShortOperand(jthread, 1);
-    cell_t returnAddress =  {.r = jthread->pc + 1 - jthread->currentStackFrame->currentMethod->codeLocation};
+    cell_t returnAddress =  {.r = jthread->pc + 1 - jthread->currentStackFrame->currentMethod->codeAttribute->code};
     jthread->pc += offset;
     pushOperand(jthread->currentStackFrame, returnAddress, TYPE_RETURN_ADDRESS);
     return 0;
 }
 
-int handle_instr_ret(jthread_t *jthread, bool wide) {
+int handle_instr_ret(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	uint16_t index;
 	if(wide)
 	    index = readShortOperand(jthread, 2);
 	else
 	    index = (uint8_t) readByteOperand(jthread, 1);
 	cell_t returnAddress = readLocal(jthread->currentStackFrame, index, NULL);
-	jthread->pc = jthread->currentStackFrame->currentMethod->codeLocation + returnAddress.r;
+	jthread->pc = jthread->currentStackFrame->currentMethod->codeAttribute->code + returnAddress.r;
 	return 0;
 }
 
-int handle_instr_tableswitch(jthread_t *jthread, bool wide) {
+int handle_instr_tableswitch(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     // calculate the offset of the integers stored in the tableswitch
     int offset = (((intptr_t) jthread->pc & ~3) + 4) - (intptr_t) jthread->pc;
     
@@ -1354,7 +1638,8 @@ int lookupswitch_binary_search(jthread_t *jthread, int base, int start, int end,
         return lookupswitch_binary_search(jthread, base, start, mid, key);
 }
 
-int handle_instr_lookupswitch(jthread_t *jthread, bool wide) {
+int handle_instr_lookupswitch(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     // calculate the offset of the integers stored in the tableswitch
     int offset = (((intptr_t) jthread->pc & ~3) + 4) - (intptr_t) jthread->pc;
     
@@ -1373,7 +1658,8 @@ int handle_instr_lookupswitch(jthread_t *jthread, bool wide) {
     return 0;
 }
 
-int handle_instr_ireturn(jthread_t *jthread, bool wide) {
+int handle_instr_ireturn(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	cell_t returnValue = popOperand(jthread->currentStackFrame, NULL);
 	jthread->pc = jthread->currentStackFrame->prevFramePC;
 	jthread->currentStackFrame = jthread->currentStackFrame->previousStackFrame;
@@ -1381,14 +1667,17 @@ int handle_instr_ireturn(jthread_t *jthread, bool wide) {
 	return 0;
 }
 
-int handle_instr_lreturn(jthread_t *jthread, bool wide) {
+int handle_instr_lreturn(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t returnValue = popOperand2(jthread->currentStackFrame, NULL);
     jthread->pc = jthread->currentStackFrame->prevFramePC;
     jthread->currentStackFrame = jthread->currentStackFrame->previousStackFrame;
     pushOperand2(jthread->currentStackFrame, returnValue, TYPE_LONG);
+    return 0;
 }
 
-int handle_instr_freturn(jthread_t *jthread, bool wide) {
+int handle_instr_freturn(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t returnValue = popOperand(jthread->currentStackFrame, NULL);
     jthread->pc = jthread->currentStackFrame->prevFramePC;
     jthread->currentStackFrame = jthread->currentStackFrame->previousStackFrame;
@@ -1396,14 +1685,17 @@ int handle_instr_freturn(jthread_t *jthread, bool wide) {
     return 0;
 }
 
-int handle_instr_dreturn(jthread_t *jthread, bool wide) {
+int handle_instr_dreturn(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     double_cell_t returnValue = popOperand2(jthread->currentStackFrame, NULL);
     jthread->pc = jthread->currentStackFrame->prevFramePC;
     jthread->currentStackFrame = jthread->currentStackFrame->previousStackFrame;
     pushOperand2(jthread->currentStackFrame, returnValue, TYPE_DOUBLE);
+    return 0;
 }
 
-int handle_instr_areturn(jthread_t *jthread, bool wide) {
+int handle_instr_areturn(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t returnValue = popOperand(jthread->currentStackFrame, NULL);
     jthread->pc = jthread->currentStackFrame->prevFramePC;
     jthread->currentStackFrame = jthread->currentStackFrame->previousStackFrame;
@@ -1411,7 +1703,8 @@ int handle_instr_areturn(jthread_t *jthread, bool wide) {
     return 0;
 }
 
-int handle_instr_return(jthread_t *jthread, bool wide) {
+int handle_instr_return(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     jthread->pc = jthread->currentStackFrame->prevFramePC;
     jthread->currentStackFrame = jthread->currentStackFrame->previousStackFrame;
     
@@ -1419,95 +1712,248 @@ int handle_instr_return(jthread_t *jthread, bool wide) {
     return -EJUST_RETURNED;
 }
 
-int handle_instr_getstatic(jthread_t *jthread, bool wide) {
+int handle_instr_getstatic(bc_interpreter_t *interpreter, bool wide) {
 	
 }
 
-int handle_instr_putstatic(jthread_t *jthread, bool wide) {
+int handle_instr_putstatic(bc_interpreter_t *interpreter, bool wide) {
 	
 }
 
-int handle_instr_getfield(jthread_t *jthread, bool wide) {
+int handle_instr_getfield(bc_interpreter_t *interpreter, bool wide) {
 	
 }
 
-int handle_instr_putfield(jthread_t *jthread, bool wide) {
+int handle_instr_putfield(bc_interpreter_t *interpreter, bool wide) {
 	
 }
 
-int handle_instr_invokevirtual(jthread_t *jthread, bool wide) {
+int handle_instr_invokevirtual(bc_interpreter_t *interpreter, bool wide) {
 	
 }
 
-int handle_instr_invokespecial(jthread_t *jthread, bool wide) {
+int handle_instr_invokespecial(bc_interpreter_t *interpreter, bool wide) {
 	
 }
 
-int handle_instr_invokestatic(jthread_t *jthread, bool wide) {
+int handle_instr_invokestatic(bc_interpreter_t *interpreter, bool wide) {
 	
 }
 
-int handle_instr_invokeinterface(jthread_t *jthread, bool wide) {
+int handle_instr_invokeinterface(bc_interpreter_t *interpreter, bool wide) {
 	
 }
 
-int handle_instr_invokedynamic(jthread_t *jthread, bool wide) {
-    throwException(jthread, "java/lang/InternalError", "Unimplemented Instruction");
+int handle_instr_invokedynamic(bc_interpreter_t *interpreter, bool wide) {
+    throwException(interpreter, "java/lang/InternalError", "Unimplemented Instruction");
     return 0;
 }
 
-int handle_instr_new(jthread_t *jthread, bool wide) {
-	
+int handle_instr_new(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
+    uint8_t classIndex = readShortOperand(jthread, 1);
+    
+    uint16_t nameIndex = jthread->currentStackFrame->currentMethod->class->constantPool[classIndex]->classInfo.nameIndex;
+    char *className = jthread->currentStackFrame->currentMethod->class->constantPool[nameIndex]->utf8Info.chars;
+    class_t *class = loadClass(className);
+    if(!class) {
+        throwException(interpreter, "NoClassDefFoundError", "Failed to find class");
+        return 0;
+    }
+    if(!initializeClass(interpreter, class)) {
+        throwException(interpreter, "java/lang/LinkageError", "Failed to initialize class");
+        return 0;
+    }
+    
+    cell_t cell;
+    cell.a = newObject(class);
+    if(!cell.a) {
+        throwException(interpreter, "java/lang/OutOfMemoryError", "Failed to create array");
+        return 0;
+    }
+    pushOperand(jthread->currentStackFrame, cell, TYPE_REFERENCE);
+    return 3;
 }
 
-int handle_instr_newarray(jthread_t *jthread, bool wide) {
-	
+int handle_instr_newarray(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
+    uint8_t arrayType = readByteOperand(jthread, 1);
+    char c;
+    switch(arrayType) {
+        case TYPE_BOOLEAN:
+            c = 'Z';
+            break;
+        case TYPE_CHAR:
+            c = 'C';
+            break;
+        case TYPE_FLOAT:
+            c = 'F';
+            break;
+        case TYPE_DOUBLE:
+            c = 'D';
+            break;
+        case TYPE_BYTE:
+            c = 'B';
+            break;
+        case TYPE_SHORT:
+            c = 'S';
+            break;
+        case TYPE_INT:
+            c = 'I';
+            break;
+        case TYPE_LONG:
+            c = 'J';
+            break;
+        default:
+            c = 'I';
+            break;
+    }
+    
+    class_t *class = loadPrimitiveClass(c);
+    if(!class) {
+        throwException(interpreter, "NoClassDefFoundError", "Failed to load primitive class");
+        return 0;
+    }
+    if(!initializeClass(interpreter, class)) {
+        throwException(interpreter, "java/lang/LinkageError", "Failed to initialize class");
+        return 0;
+    }
+    
+    int32_t size = popOperand(jthread->currentStackFrame, NULL).i;
+    
+    cell_t cell;
+    cell.a = newArray(1, &size, class);
+    if(!cell.a) {
+        throwException(interpreter, "java/lang/OutOfMemoryError", "Failed to create array");
+        return 0;
+    }
+    pushOperand(jthread->currentStackFrame, cell, TYPE_REFERENCE);
+    return 2;
 }
 
-int handle_instr_anewarray(jthread_t *jthread, bool wide) {
-	
+int handle_instr_anewarray(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
+    uint8_t classIndex = readShortOperand(jthread, 1);
+    
+    uint16_t nameIndex = jthread->currentStackFrame->currentMethod->class->constantPool[classIndex]->classInfo.nameIndex;
+    char *className = jthread->currentStackFrame->currentMethod->class->constantPool[nameIndex]->utf8Info.chars;
+    class_t *class = loadClass(className);
+    if(!class) {
+        throwException(interpreter, "NoClassDefFoundError", "Failed to find class");
+        return 0;
+    }
+    if(!initializeClass(interpreter, class)) {
+        throwException(interpreter, "java/lang/LinkageError", "Failed to initialize class");
+        return 0;
+    }
+    
+    int32_t size = popOperand(jthread->currentStackFrame, NULL).i;
+    
+    cell_t cell;
+    cell.a = newArray(1, &size, class);
+    if(!cell.a) {
+        throwException(interpreter, "java/lang/OutOfMemoryError", "Failed to create array");
+        return 0;
+    }
+    pushOperand(jthread->currentStackFrame, cell, TYPE_REFERENCE);
+    return 3;
 }
 
-int handle_instr_arraylength(jthread_t *jthread, bool wide) {
+int handle_instr_arraylength(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
 	cell_t cell = popOperand(jthread->currentStackFrame, NULL);
-	array_object_t *array = (array_object_t *) getObject(cell.a);
+	object_t *array = getObject(cell.a);
 	if(!array) {
-	    throwException(jthread, "java/lang/NullPointerException", "Array cannot be null");
+	    throwException(interpreter, "java/lang/NullPointerException", "Array cannot be null");
 	    return 0;
 	}
 	cell.i = array->length;
 	pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
 }
 
-int handle_instr_athrow(jthread_t *jthread, bool wide) {
+int handle_instr_athrow(bc_interpreter_t *interpreter, bool wide) {
+    slot_t slot = popOperand(interpreter->jthread->currentStackFrame, NULL).a;
+    if(!slot) {
+        throwException(interpreter, "java/lang/NullPointerException", "Cannot throw null");
+        return 0;
+    }
+    object_t *obj = getObject(slot);
+    interpreter->exception = obj;
+    return 0;
+}
+
+int handle_instr_checkcast(bc_interpreter_t *interpreter, bool wide) {
+    throwException(interpreter, "java/lang/InternalError", "Unimplemented Instruction");
+    return 0;
+}
+
+int handle_instr_instanceof(bc_interpreter_t *interpreter, bool wide) {
+    throwException(interpreter, "java/lang/InternalError", "Unimplemented Instruction");
+    return 0;
+}
+
+int handle_instr_monitorenter(bc_interpreter_t *interpreter, bool wide) {
+	slot_t slot = popOperand(interpreter->jthread->currentStackFrame, NULL).a;
+	if(!slot) {
+	    throwException(interpreter, "java/lang/NullPointerException", "Cannot enter a monitor on a null object");
+	    return 0;
+	}
+	object_t *obj = getObject(slot);
+	jlock_lock(interpreter->jthread->id, &obj->jlock);
+	return 1;
+}
+
+int handle_instr_monitorexit(bc_interpreter_t *interpreter, bool wide) {
+    slot_t slot = popOperand(interpreter->jthread->currentStackFrame, NULL).a;
+    if(!slot) {
+        throwException(interpreter, "java/lang/NullPointerException", "Cannot exit a monitor on a null object");
+        return 0;
+    }
+    object_t *obj = getObject(slot);
+    if(interpreter->jthread->id != obj->jlock.owner) {
+        throwException(interpreter, "java/lang/IllegalMonitorStateException", "Cannot exit a monitor that you do not own");
+        return 0;
+    }
+    jlock_unlock(interpreter->jthread->id, &obj->jlock);
+    return 1;
+}
+
+int handle_instr_wide(bc_interpreter_t *interpreter, bool wide) {
+    return instr_table[(uint8_t) readByteOperand(interpreter->jthread, 1)](interpreter, true);
+}
+
+int handle_instr_multianewarray(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
+	uint16_t classIndex = readShortOperand(jthread, 1);
+	uint8_t numDimensions = readByteOperand(jthread, 3);
 	
-}
-
-int handle_instr_checkcast(jthread_t *jthread, bool wide) {
+	uint16_t nameIndex = jthread->currentStackFrame->currentMethod->class->constantPool[classIndex]->classInfo.nameIndex;
+	char *className = jthread->currentStackFrame->currentMethod->class->constantPool[nameIndex]->utf8Info.chars;
+	class_t *class = loadClass(className);
+	if(!class) {
+	    throwException(interpreter, "NoClassDefFoundError", "Failed to find class");
+	    return 0;
+	}
+	if(!initializeClass(interpreter, class)) {
+	    throwException(interpreter, "java/lang/LinkageError", "Failed to initialize class");
+	    return 0;
+	}
 	
-}
-
-int handle_instr_instanceof(jthread_t *jthread, bool wide) {
+	int32_t *sizes = (int32_t *) (jthread->currentStackFrame->operandStackBase + jthread->currentStackFrame->topOfStack - numDimensions);
 	
+	cell_t cell;
+	cell.a = newArray(numDimensions, sizes, class);
+	if(!cell.a) {
+	    throwException(interpreter, "java/lang/OutOfMemoryError", "Failed to create array");
+	    return 0;
+	}
+	jthread->currentStackFrame->topOfStack -= numDimensions;
+	pushOperand(jthread->currentStackFrame, cell, TYPE_REFERENCE);
+    return 4;
 }
 
-int handle_instr_monitorenter(jthread_t *jthread, bool wide) {
-	
-}
-
-int handle_instr_monitorexit(jthread_t *jthread, bool wide) {
-	
-}
-
-int handle_instr_wide(jthread_t *jthread, bool wide) {
-    return instr_table[(uint8_t) readByteOperand(jthread, 1)](jthread, true);
-}
-
-int handle_instr_multianewarray(jthread_t *jthread, bool wide) {
-	
-}
-
-int handle_instr_ifnull(jthread_t *jthread, bool wide) {
+int handle_instr_ifnull(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
     if(top.a == 0) {
@@ -1517,7 +1963,8 @@ int handle_instr_ifnull(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_ifnonnull(jthread_t *jthread, bool wide) {
+int handle_instr_ifnonnull(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     cell_t top = popOperand(jthread->currentStackFrame, NULL);
     int16_t offset = readShortOperand(jthread, 1);
     if(top.a != 0) {
@@ -1527,31 +1974,33 @@ int handle_instr_ifnonnull(jthread_t *jthread, bool wide) {
     return 3;
 }
 
-int handle_instr_goto_w(jthread_t *jthread, bool wide) {
+int handle_instr_goto_w(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     int32_t offset = readIntOperand(jthread, 1);
     jthread->pc += offset;
     return 0;
 }
 
-int handle_instr_jsr_w(jthread_t *jthread, bool wide) {
+int handle_instr_jsr_w(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
     int32_t offset = readIntOperand(jthread, 1);
-    cell_t returnAddress =  {.r = jthread->pc + 1 - jthread->currentStackFrame->currentMethod->codeLocation};
+    cell_t returnAddress =  {.r = jthread->pc + 1 - jthread->currentStackFrame->currentMethod->codeAttribute->code};
     jthread->pc += offset;
     pushOperand(jthread->currentStackFrame, returnAddress, TYPE_RETURN_ADDRESS);
     return 0;
 }
 
-int handle_instr_breakpoint(jthread_t *jthread, bool wide) {
-    throwException(jthread, "java/lang/InternalError", "Unimplemented Instruction");
+int handle_instr_breakpoint(bc_interpreter_t *interpreter, bool wide) {
+    throwException(interpreter, "java/lang/InternalError", "Unimplemented Instruction");
 	return 0;
 }
 
-int handle_instr_impdep1(jthread_t *jthread, bool wide) {
-    throwException(jthread, "java/lang/InternalError", "Unimplemented Instruction");
+int handle_instr_impdep1(bc_interpreter_t *interpreter, bool wide) {
+    throwException(interpreter, "java/lang/InternalError", "Unimplemented Instruction");
     return 0;
 }
 
-int handle_instr_impdep2(jthread_t *jthread, bool wide) {
-    throwException(jthread, "java/lang/InternalError", "Unimplemented Instruction");
+int handle_instr_impdep2(bc_interpreter_t *interpreter, bool wide) {
+    throwException(interpreter, "java/lang/InternalError", "Unimplemented Instruction");
     return 0;
 }

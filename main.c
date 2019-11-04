@@ -11,48 +11,7 @@
 #include "classloader.h"
 #include "flags.h"
 
-slot_t convertToJavaString(char *arg) {
-    size_t length = strlen(arg);
-    if(length > INT32_MAX)
-        return 0;
-    
-    // TODO convert to UTF-16
-    
-    class_t *stringClass = loadClass("java/lang/String");
-    if(!stringClass)
-        return 0;
-    
-    int32_t stringLength = (int32_t) length;
-    slot_t charArraySlot = newArray(1, &stringLength, stringClass);
-    if(!charArraySlot)
-        return 0;
-    
-    array_object_t *charArray = (array_object_t *) getObject(charArraySlot);
-    for(int i = 0; i < stringLength; i++) {
-        cell_t cell = {.c = arg[i]};
-        setArrayElement(charArray, i, cell);
-    }
-    
-    slot_t stringSlot = newObject(stringClass);
-    if(!stringSlot)
-        return 0;
-    
-    object_t *stringObject = getObject(stringSlot);
-    for(int i = 0; i < stringClass->numFields; i++) {
-        field_t *valueField = stringClass->fields + i;
-        if(!strcmp(valueField->name, "value") && valueField->type.type == TYPE_REFERENCE && valueField->type.classPointer == charArray->class) {
-            uint32_t offset = valueField->objectOffset;
-            slot_t *value = ((void *) stringObject) + offset;
-            *value = charArraySlot;
-            return stringSlot;
-        }
-    }
-    
-    // failed to find the value field which means something is wrong. This shouldn't happen
-    return 0;
-}
-
-array_object_t *convertToJavaArgs(int numArgs, char **args) {
+object_t *convertToJavaArgs(int numArgs, char **args) {
     class_t *stringClass = loadClass("java/lang/String");
     if(!stringClass)
         return NULL;
@@ -61,7 +20,7 @@ array_object_t *convertToJavaArgs(int numArgs, char **args) {
     if(!stringArraySlot)
         return NULL;
     
-    array_object_t *stringArray = (array_object_t *) getObject(stringArraySlot);
+    object_t *stringArray = getObject(stringArraySlot);
     for(int i = 0; i < numArgs; i++) {
         slot_t stringSlot = convertToJavaString(args[i]);
         if(!stringSlot)
@@ -234,12 +193,12 @@ int main(int argc, char **args) {
         }
     }
     
-    array_object_t *javaArgs = convertToJavaArgs(numArgs, progArgs);
+    object_t *javaArgs = convertToJavaArgs(numArgs, progArgs);
     
     method_t *main = NULL;
     for(int i = 0; i < mainClass->numMethods; i++) {
         method_t *method = mainClass->methods + i;
-        if(!strcmp(method->name, "main") && (method->flags & METHOD_ACC_STATIC) && method->numParameters == 1 && method->parameterTypes[0].type == TYPE_REFERENCE && method->parameterTypes[0].classPointer == javaArgs->class) {
+        if(!strcmp(method->name, "main") && (method->flags & METHOD_ACC_STATIC) && strcmp(method->descriptor, "([Ljava/lang/String;)V") == 0) {
             main = method;
             break;
         }

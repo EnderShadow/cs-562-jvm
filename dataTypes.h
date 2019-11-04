@@ -8,7 +8,7 @@
 #define JVM_DATATYPES_H
 
 #include <stdint.h>
-#include "utils.h"
+#include <stdbool.h>
 
 #define TYPE_BOOLEAN            0
 #define TYPE_CHAR               1
@@ -40,8 +40,9 @@ typedef union double_cell {
     double d;
 } double_cell_t;
 
-#include <assert.h>
-
-static_assert(sizeof(cell_t) * 2 == sizeof(double_cell_t), "cell_t is not half the size of double_cell_t");
+uint8_t getTypeFromFieldDescriptor(char *descriptor);
+uint8_t getTypeFromMethodDescriptor(char *descriptor, uint16_t index, bool isStatic);
+uint16_t getSizeOfTypeFromFieldDescriptor(char *descriptor);
+uint16_t countNumParametersFromMethodDescriptor(char *descriptor, bool isStatic);
 
 #endif //JVM_DATATYPES_H

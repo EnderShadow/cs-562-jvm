@@ -17,11 +17,12 @@ bool initHeap();
 void destroyHeap();
 
 object_t *allocateObject(class_t *class);
-array_object_t *allocateArrayObject(class_t *class, int elementSize, int32_t numElements, bool fillZero);
+object_t *allocateArrayObject(class_t *class, int elementSize, int32_t numElements, bool fillZero);
 void switchActiveHalf();
 
 bool isInYoungHeap(object_t *obj);
 bool isInOldHeap(object_t *obj);
+bool isInHeap(object_t *obj);
 
 /**
  *
@@ -36,10 +37,5 @@ object_t *moveToActiveHalf(object_t *obj);
  * @return the new pointer to the object or the old one if it didn't change
  */
 object_t *moveToOldGeneration(object_t *obj);
-
-class_t *allocateClass();
-method_t *allocateMethod();
-field_t *allocateField();
-type_t *allocateType();
 
 #endif //JVM_HEAP_H

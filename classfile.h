@@ -6,6 +6,7 @@
 #define JVM_CLASSFILE_H
 
 #include <stdint.h>
+#include "jlock.h"
 
 typedef struct class_info {
     uint8_t tag;
@@ -95,7 +96,7 @@ typedef struct code_attribute {
     char *name;
     uint16_t maxStack;
     uint16_t maxLocals;
-    uint64_t codeLength;
+    uint32_t codeLength;
     void *code;
     uint16_t exceptionTableLength;
     exception_table_t *exceptionHandlers;
@@ -108,10 +109,6 @@ typedef struct skipped_attribute {
     char *name;
 } skipped_attribute_t;
 
-typedef struct synthetic_attribute {
-    char *name;
-} synthetic_attribute_t;
-
 typedef struct signature_attribute {
     char *name;
     uint16_t signatureIndex;
@@ -121,7 +118,6 @@ union attribute_info {
     constant_value_attribute_t constantValueAttribute;
     code_attribute_t codeAttribute;
     skipped_attribute_t skippedAttribute;
-    synthetic_attribute_t syntheticAttribute;
     signature_attribute_t signatureAttribute;
 };
 
@@ -131,30 +127,31 @@ typedef struct type_info {
 } type_t;
 
 typedef struct field {
-    type_t type;
     char *name;
+    char *descriptor;
+    class_t *class;
     attribute_info_t **attributes;
     uint32_t objectOffset;
+    uint16_t dataSize;
     uint16_t numAttributes;
     uint16_t flags;
 } field_t;
 
 typedef struct method {
-    type_t returnType;
     char *name;
-    type_t *parameterTypes;
-    void *codeLocation;
-    exception_table_t *exceptionTable;
+    char *descriptor;
+    class_t *class;
+    code_attribute_t *codeAttribute;
     attribute_info_t **attributes;
     uint16_t numAttributes;
-    uint16_t numLocals;
-    uint16_t maxStack;
     uint16_t flags;
     uint8_t numParameters;
 } method_t;
 
 #define CLASS_STATUS_LOADING 0
 #define CLASS_STATUS_LOADED 1
+#define CLASS_STATUS_INITIALIZING 2
+#define CLASS_STATUS_INITIALIZED 3
 
 struct class {
     char *name;
@@ -164,14 +161,18 @@ struct class {
     struct class **interfaces;
     method_t *methods;
     field_t *fields;
+    attribute_info_t **attributes;
     void *staticFieldData;
+    jlock_t jlock;
     uint16_t numConstants;
     uint16_t numInterfaces;
     uint16_t numMethods;
     uint16_t numFields;
+    uint16_t numAttributes;
     uint16_t objectSize;
+    uint16_t staticDataSize;
     uint16_t flags;
-    uint8_t status;
+    volatile uint8_t status;
 };
 
 /**

@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 
-#define PAGE_SIZE getpagesize()
+#define PAGE_SIZE ((size_t) getpagesize())
 #define ADDR_PER_PAGE (PAGE_SIZE / sizeof(void *))
 
 typedef struct FreeSlotNode {

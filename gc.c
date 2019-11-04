@@ -14,6 +14,10 @@ volatile atomic_uint_fast32_t numThreads = 0;
 volatile atomic_uint_fast32_t numThreadsWaiting = 0;
 pthread_mutex_t gcRunningMutex = PTHREAD_MUTEX_INITIALIZER;
 
+pthread_mutex_t threadRegistrationMutex = PTHREAD_MUTEX_INITIALIZER;
+jthread_t **jthreads = NULL;
+size_t maxNumThreads = 0;
+
 size_t gcCycle = 0;
 volatile clock_t lastGC;
 
@@ -41,13 +45,51 @@ void savePoint() {
     pthread_mutex_unlock(&gcRunningMutex);
 }
 
+bool registerThread(jthread_t *jthread) {
+    pthread_mutex_lock(&threadRegistrationMutex);
+    if(numThreads == maxNumThreads) {
+        jthread_t **newArray = realloc(jthreads, sizeof(jthread_t *) * maxNumThreads * 2);
+        if(!newArray) {
+            pthread_mutex_unlock(&threadRegistrationMutex);
+            return false;
+        }
+        jthreads = newArray;
+        maxNumThreads *= 2;
+    }
+    jthreads[numThreads++] = jthread;
+    pthread_mutex_unlock(&threadRegistrationMutex);
+    return true;
+}
+
+void unregisterThread(jthread_t *jthread) {
+    pthread_mutex_lock(&threadRegistrationMutex);
+    size_t i = 0;
+    while(i < numThreads) {
+        if(jthreads[i] == jthread)
+            break;
+        ++i;
+    }
+    if(i < numThreads) {
+        jthreads[i] = jthreads[numThreads - 1];
+        --numThreads;
+    }
+    pthread_mutex_unlock(&threadRegistrationMutex);
+}
+
 pthread_t *initGC() {
     lastGC = clock();
-    pthread_t *thread = malloc(sizeof(pthread_t));
-    if(!thread)
+    jthreads = malloc(sizeof(jthread_t *) * 4);
+    if(!jthreads)
         return NULL;
+    maxNumThreads = 4;
+    pthread_t *thread = malloc(sizeof(pthread_t));
+    if(!thread) {
+        free(jthreads);
+        return NULL;
+    }
     if(pthread_create(thread, NULL, gcLoop, NULL)) {
         free(thread);
+        free(jthreads);
         return NULL;
     }
     

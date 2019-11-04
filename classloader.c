@@ -16,6 +16,9 @@
 #include "flags.h"
 #include "dataTypes.h"
 #include "attributes.h"
+#include "object.h"
+#include "jthread.h"
+#include "jvmSettings.h"
 
 char **classpath = NULL;
 int classpathLength = 0;
@@ -123,8 +126,22 @@ class_t *loadPrimitiveClass0(char primitive) {
     class_t *class = ht_get(loadedClasses, className);
     if(class)
         return class;
-    // TODO create primitive class
-    return NULL;
+    
+    class = calloc(1, sizeof(class_t));
+    if(!class)
+        return NULL;
+    class->name = calloc(2, sizeof(char));
+    if(!class->name) {
+        free(class);
+        return NULL;
+    }
+    class->name[0] = primitive;
+    class->status = CLASS_STATUS_INITIALIZED;
+    class->thisClass = class;
+    class->flags = CLASS_ACC_FINAL | CLASS_ACC_PUBLIC | CLASS_ACC_SYNTHETIC;
+    jlock_init(&class->jlock);
+    ht_put(loadedClasses, class->name, class);
+    return class;
 }
 
 // Used specifically when parsing field, method parameter, and method return types
@@ -136,12 +153,31 @@ class_t *loadPrimitiveClass(char className) {
 }
 
 class_t *loadArrayClass(char *className) {
-    // TODO load array class
-    return NULL;
+    class_t *superclass = loadClass0("java/lang/Object");
+    if(!superclass)
+        return NULL;
+    class_t *class = calloc(1, sizeof(class_t));
+    if(!class)
+        return NULL;
+    class->name = malloc(strlen(className) + 1);
+    if(!class->name) {
+        free(class);
+        return NULL;
+    }
+    strcpy(class->name, className);
+    class->status = CLASS_STATUS_INITIALIZED;
+    class->thisClass = class;
+    class->superClass = superclass;
+    class->objectSize = sizeof(object_t);
+    class->flags = CLASS_ACC_FINAL | CLASS_ACC_PUBLIC | CLASS_ACC_SYNTHETIC;
+    jlock_init(&class->jlock);
+    ht_put(loadedClasses, class->name, class);
+    return class;
 }
 
-bool parseMethodDescriptor(method_t *method, class_t *class, char *methodDescriptor) {
-    return false;
+int fieldCompare(const void *a, const void *b) {
+    // comparison is done as b - a so that qsort sorts them in descending order
+    return ((field_t *) b)->dataSize - ((field_t *) a)->dataSize;
 }
 
 class_t *parseClassFile(void *classData) {
@@ -231,56 +267,9 @@ class_t *parseClassFile(void *classData) {
         uint16_t nameIndex = readu2(classData + 2);
         field->name = class->constantPool[nameIndex]->utf8Info.chars;
         uint16_t descriptorIndex = readu2(classData + 4);
-        char *descriptor = class->constantPool[descriptorIndex]->utf8Info.chars;
-        if(descriptor[0] == 'L') {
-            field->type.type = TYPE_REFERENCE;
-            size_t descriptorLength = strlen(descriptor);
-            descriptor[descriptorLength - 1] = '\0';
-            field->type.classPointer = loadClass0(descriptor + 1);
-            descriptor[descriptorLength - 1] = ';';
-            if(!field->type.classPointer)
-                goto fail4;
-        }
-        else if(descriptor[0] == '[') {
-            field->type.type = TYPE_REFERENCE;
-            field->type.classPointer = loadArrayClass(descriptor);
-            if(!field->type.classPointer)
-                goto fail4;
-        }
-        else {
-            field->type.classPointer = loadPrimitiveClass0(descriptor[0]);
-            if(!field->type.classPointer)
-                goto fail4;
-            switch(descriptor[0]) {
-                case 'B':
-                    field->type.type = TYPE_BYTE;
-                    break;
-                case 'C':
-                    field->type.type = TYPE_CHAR;
-                    break;
-                case 'D':
-                    field->type.type = TYPE_DOUBLE;
-                    break;
-                case 'F':
-                    field->type.type = TYPE_FLOAT;
-                    break;
-                case 'I':
-                    field->type.type = TYPE_INT;
-                    break;
-                case 'J':
-                    field->type.type = TYPE_LONG;
-                    break;
-                case 'S':
-                    field->type.type = TYPE_SHORT;
-                    break;
-                case 'Z':
-                    field->type.type = TYPE_BOOLEAN;
-                    break;
-                default:
-                    printf("Unknown field type: %s\n", descriptor);
-                    goto fail4;
-            }
-        }
+        field->descriptor = class->constantPool[descriptorIndex]->utf8Info.chars;
+        field->class = class;
+        field->dataSize = getSizeOfTypeFromFieldDescriptor(field->descriptor);
         field->numAttributes = readu2(classData + 6);
         classData += 8;
         field->attributes = calloc(field->numAttributes, sizeof(attribute_info_t *));
@@ -290,6 +279,7 @@ class_t *parseClassFile(void *classData) {
         if(!classData)
             goto fail4;
     }
+    qsort(class->fields, class->numFields, sizeof(field_t), fieldCompare);
     
     // ============================================
     // parse methods
@@ -306,26 +296,81 @@ class_t *parseClassFile(void *classData) {
         uint16_t nameIndex = readu2(classData + 2);
         method->name = class->constantPool[nameIndex]->utf8Info.chars;
         uint16_t descriptorIndex = readu2(classData + 4);
-        char *descriptor = class->constantPool[descriptorIndex]->utf8Info.chars;
-        bool success = parseMethodDescriptor(method, class, descriptor);
-        
-        // TODO
-    
+        method->descriptor = class->constantPool[descriptorIndex]->utf8Info.chars;
+        method->class = class;
+        method->numParameters = countNumParametersFromMethodDescriptor(method->descriptor, method->flags & METHOD_ACC_STATIC);
         method->numAttributes = readu2(classData + 6);
         classData += 8;
+        method->attributes = calloc(method->numAttributes, sizeof(attribute_info_t *));
+        if(!method->attributes)
+            goto fail5;
+        classData = parseAttributes(method->numAttributes, method->attributes, class, classData);
+        if(!classData)
+            goto fail5;
         
-        // TODO
+        if((method->flags & (METHOD_ACC_NATIVE | METHOD_ACC_ABSTRACT)) == 0) {
+            for(int j = 0; j < method->numAttributes; ++j) {
+                if(strcmp(method->attributes[j]->codeAttribute.name, "Code") == 0) {
+                    method->codeAttribute = &(method->attributes[j]->codeAttribute);
+                    break;
+                }
+            }
+        }
     }
     
     // ============================================
-    // parse attributes
+    // parse class attributes
     // ============================================
     
-    // TODO
+    class->numAttributes = readu2(classData);
+    classData += 2;
+    class->attributes = calloc(class->numAttributes, sizeof(attribute_info_t *));
+    if(!class->attributes)
+        goto fail5;
+    classData = parseAttributes(class->numAttributes, class->attributes, class, classData);
+    if(!classData)
+        goto fail6;
+    
+    class->staticDataSize = 0;
+    class->objectSize = sizeof(object_t);
+    for(int i = 0; i < class->numFields; ++i) {
+        field_t *field = class->fields + i;
+        if(field->flags & FIELD_ACC_STATIC) {
+            field->objectOffset = class->staticDataSize;
+            class->staticDataSize += field->dataSize;
+        }
+        else {
+            field->objectOffset = class->objectSize;
+            class->objectSize += field->dataSize;
+        }
+    }
+    class->staticFieldData = calloc(1, class->staticDataSize);
+    if(!class->staticFieldData)
+        goto fail6;
     
     class->status = CLASS_STATUS_LOADED;
     return class;
     
+    fail6:
+    for(int i = 0; i < class->numAttributes; ++i) {
+        if(!class->attributes[i])
+            break;
+        free(class->attributes[i]);
+    }
+    free(class->attributes);
+    fail5:
+    for(int i = 0; i < class->numMethods; ++i) {
+        method_t *method = class->methods + i;
+        if(!method)
+            break;
+        for(int j = 0; j < method->numAttributes; ++j) {
+            if(!method->attributes[j])
+                break;
+            free(method->attributes[j]);
+        }
+        free(method->attributes);
+    }
+    free(class->methods);
     fail4:
     for(int i = 0; i < class->numFields; ++i) {
         field_t *field = class->fields + i;
@@ -355,7 +400,7 @@ class_t *loadClass0(char *className) {
     // check if class is loaded
     class_t *class = ht_get(loadedClasses, className);
     if(class) {
-        if(class->status == CLASS_STATUS_LOADED)
+        if(class->status != CLASS_STATUS_LOADING)
             return class;
         // the class was already partially loaded. This means cyclic classes
         printf("Failed to load class due to a cyclic dependency: %s\n", className);
@@ -381,10 +426,12 @@ class_t *loadClass0(char *className) {
         return NULL;
     }
     class_t *classFile = parseClassFile(classData);
+    
+    // I forget if I copied all relevant data out of the class file or not, so I might not need it mapped anymore, but just in case, I'll keep it.
     if(!classFile)
         munmap(classData, s.st_size);
-    
-    // TODO run <clinit>
+    else
+        jlock_init(&classFile->jlock);
     
     return classFile;
 }

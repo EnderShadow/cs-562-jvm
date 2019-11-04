@@ -13,7 +13,10 @@
 // used when an exception reaches the top of the stack without encountering an exception handler
 #define ETHREW_OFF_THREAD   3
 
-#define bc_interpreter_t jthread_t
+typedef struct bc_interpreter {
+    jthread_t *jthread;
+    object_t *exception;
+} bc_interpreter_t;
 
 int run(bc_interpreter_t *interpreter);
 

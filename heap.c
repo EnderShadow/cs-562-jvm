@@ -73,7 +73,7 @@ object_t *allocateObject(class_t *class) {
     return obj;
 }
 
-array_object_t *allocateArrayObject(class_t *class, int elementSize, int32_t numElements, bool fillZero) {
+object_t *allocateArrayObject(class_t *class, int elementSize, int32_t numElements, bool fillZero) {
     size_t objectSize = class->objectSize + elementSize * numElements;
     pthread_mutex_lock(&allocationMutex);
     if(edenSize - edenNextPos < objectSize) {
@@ -108,11 +108,24 @@ void switchActiveHalf() {
 }
 
 bool isInYoungHeap(object_t *obj) {
-    return (void *) obj >= young1 && (void *) obj + obj->class->objectSize < old;
+    size_t objectSize = obj->class->objectSize;
+    if(obj->class->name[0] == '[')
+        objectSize += obj->length * arrayElementSize(obj->class);
+    return (void *) obj >= young1 && (void *) obj + objectSize < old;
 }
 
 bool isInOldHeap(object_t *obj) {
-    return (void *) obj >= old && (void *) obj + obj->class->objectSize < endHeap;
+    size_t objectSize = obj->class->objectSize;
+    if(obj->class->name[0] == '[')
+        objectSize += obj->length * arrayElementSize(obj->class);
+    return (void *) obj >= old && (void *) obj + objectSize < endHeap;
+}
+
+bool isInHeap(object_t *obj) {
+    size_t objectSize = obj->class->objectSize;
+    if(obj->class->name[0] == '[')
+        objectSize += obj->length * arrayElementSize(obj->class);
+    return (void *) obj >= eden  && (void *) obj + objectSize < endHeap;
 }
 
 /**
@@ -123,7 +136,7 @@ bool isInOldHeap(object_t *obj) {
 object_t *moveToActiveHalf(object_t *obj) {
     size_t objSize = obj->class->objectSize;
     if(isArrayClass(obj->class))
-        objSize += ((array_object_t *) obj)->length * arrayElementSize(obj->class);
+        objSize += obj->length * arrayElementSize(obj->class);
     object_t *newObjPointer = obj;
     
     if(usingFirstYoung) {
@@ -152,7 +165,7 @@ object_t *moveToActiveHalf(object_t *obj) {
 object_t *moveToOldGeneration(object_t *obj) {
     size_t objSize = obj->class->objectSize;
     if(isArrayClass(obj->class))
-        objSize += ((array_object_t *) obj)->length * arrayElementSize(obj->class);
+        objSize += obj->length * arrayElementSize(obj->class);
     object_t *newObjPointer = obj;
     
     if(!isInOldHeap(obj)) {
@@ -168,20 +181,4 @@ object_t *moveToOldGeneration(object_t *obj) {
     }
     
     return newObjPointer;
-}
-
-class_t *allocateClass() {
-    return malloc(sizeof(class_t));
-}
-
-method_t *allocateMethod() {
-    return malloc(sizeof(method_t));
-}
-
-field_t *allocateField() {
-    return malloc(sizeof(field_t));
-}
-
-type_t *allocateType() {
-    return malloc(sizeof(type_t));
 }
