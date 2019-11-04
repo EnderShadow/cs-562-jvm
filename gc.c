@@ -8,6 +8,7 @@
 #include "garbage_collection.h"
 #include "jvmSettings.h"
 #include "mm.h"
+#include "utils.h"
 
 volatile bool gcWantsToRun = false;
 volatile atomic_uint_fast32_t numThreads = 0;

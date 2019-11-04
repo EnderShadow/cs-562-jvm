@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <string.h>
 #include "gc.h"
+#include "utils.h"
 
 pthread_mutex_t allocationMutex = PTHREAD_MUTEX_INITIALIZER;
 

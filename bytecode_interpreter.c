@@ -118,7 +118,7 @@ bool initializeClass(bc_interpreter_t *interpreter, class_t *class) {
     
     class->status = CLASS_STATUS_INITIALIZING;
     
-    if(!initializeClass(class->superClass)) {
+    if(!initializeClass(interpreter, class->superClass)) {
         class->status = CLASS_STATUS_LOADED;
         jlock_unlock(interpreter->jthread->id, &class->jlock);
         return false;
