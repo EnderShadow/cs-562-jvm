@@ -253,6 +253,39 @@ field_t *resolveField(bc_interpreter_t *interpreter, uint16_t fieldIndex, bool i
     return resolveField0(interpreter, fieldClass, fieldName, descriptor, isStatic);
 }
 
+method_t *resolveMethod0(bc_interpreter_t *interpreter, class_t *methodClass, char *methodName, char* descriptor, bool isStatic) {
+
+}
+
+method_t *resolveMethod(bc_interpreter_t *interpreter, uint16_t methodIndex, bool isStatic) {
+    constant_info_t **constantPool = interpreter->jthread->currentStackFrame->currentMethod->class->constantPool;
+    field_method_interface_method_ref_info_t *methodRef = &constantPool[methodIndex]->fieldMethodInterfaceMethodRefInfo;
+    
+    name_and_type_info_t *nameAndTypeInfo = &constantPool[methodRef->nameAndTypeIndex]->nameAndTypeInfo;
+    char *methodName = constantPool[nameAndTypeInfo->nameIndex]->utf8Info.chars;
+    char *descriptor = constantPool[nameAndTypeInfo->descriptorIndex]->utf8Info.chars;
+    
+    class_info_t *methodClassInfo = &constantPool[methodRef->classIndex]->classInfo;
+    char *className = constantPool[methodClassInfo->nameIndex]->utf8Info.chars;
+    
+    class_t *methodClass;
+    if(isStatic) {
+        methodClass = loadClass(className);
+    }
+    else {
+        uint16_t numArgs = countNumParametersFromMethodDescriptor(descriptor, isStatic);
+        object_t *obj = getObject(peekOperand(interpreter->jthread->currentStackFrame, numArgs - 1, NULL).a);
+        methodClass = obj->class;
+    }
+    
+    if(!methodClass) {
+        throwException(interpreter, "java/lang/NoClassDefFoundError", "Failed to load class");
+        return NULL;
+    }
+    
+    return resolveMethod0(interpreter, methodClass, methodName, descriptor, isStatic);
+}
+
 int handle_instr_xload(bc_interpreter_t *interpreter, bool wide, uint8_t type) {
     jthread_t *jthread = interpreter->jthread;
     uint16_t index;
@@ -1980,19 +2013,22 @@ int handle_instr_putfield(bc_interpreter_t *interpreter, bool wide) {
 }
 
 int handle_instr_invokevirtual(bc_interpreter_t *interpreter, bool wide) {
-	
+    jthread_t *jthread = interpreter->jthread;
+    uint16_t methodIndex = readShortOperand(jthread, 1);
+	method_t *method = resolveMethod(interpreter, methodIndex, false);
+    return 3;
 }
 
 int handle_instr_invokespecial(bc_interpreter_t *interpreter, bool wide) {
-	
+    return 3;
 }
 
 int handle_instr_invokestatic(bc_interpreter_t *interpreter, bool wide) {
-	
+	return 3;
 }
 
 int handle_instr_invokeinterface(bc_interpreter_t *interpreter, bool wide) {
-	
+	return 5;
 }
 
 int handle_instr_invokedynamic(bc_interpreter_t *interpreter, bool wide) {
