@@ -196,6 +196,63 @@ bool initializeClass(bc_interpreter_t *interpreter, class_t *class) {
     return true;
 }
 
+field_t *resolveField0(bc_interpreter_t *interpreter, class_t *fieldClass, char *fieldName, char* descriptor, bool isStatic) {
+    if(!fieldClass)
+        return NULL;
+    
+    if(!initializeClass(interpreter, fieldClass)) {
+        throwException(interpreter, "java/lang/ExceptionInInitializerError", "Failed to initialize class");
+        return NULL;
+    }
+    
+    field_t *field = NULL;
+    for(int i = 0; i < fieldClass->numFields; ++i) {
+        field_t *possibleField = fieldClass->fields + i;
+        if((bool) (possibleField->flags & FIELD_ACC_STATIC) == isStatic && strcmp(possibleField->name, fieldName) == 0 && strcmp(possibleField->descriptor, descriptor) == 0) {
+            field = possibleField;
+            break;
+        }
+    }
+    
+    if(!isStatic && !field) {
+        for(int i = 0; i < fieldClass->numInterfaces; ++i) {
+            class_t *interface = fieldClass->interfaces[i];
+            field = resolveField0(interpreter, interface, fieldName, descriptor, isStatic);
+            if(field)
+                break;
+        }
+        if(!field)
+            field = resolveField0(interpreter, fieldClass->superClass, fieldName, descriptor, isStatic);
+    }
+    
+    if(!field) {
+        throwException(interpreter, "java/lang/IncompatibleClassChangeError", "No field found that matches the name and descriptor");
+        return NULL;
+    }
+    
+    return field;
+}
+
+field_t *resolveField(bc_interpreter_t *interpreter, uint16_t fieldIndex, bool isStatic) {
+    constant_info_t **constantPool = interpreter->jthread->currentStackFrame->currentMethod->class->constantPool;
+    field_method_interface_method_ref_info_t *fieldRef = &constantPool[fieldIndex]->fieldMethodInterfaceMethodRefInfo;
+    
+    name_and_type_info_t *nameAndTypeInfo = &constantPool[fieldRef->nameAndTypeIndex]->nameAndTypeInfo;
+    char *fieldName = constantPool[nameAndTypeInfo->nameIndex]->utf8Info.chars;
+    char *descriptor = constantPool[nameAndTypeInfo->descriptorIndex]->utf8Info.chars;
+    
+    class_info_t *fieldClassInfo = &constantPool[fieldRef->classIndex]->classInfo;
+    char *className = constantPool[fieldClassInfo->nameIndex]->utf8Info.chars;
+    
+    class_t *fieldClass = loadClass(className);
+    if(!fieldClass) {
+        throwException(interpreter, "java/lang/NoClassDefFoundError", "Failed to load class");
+        return NULL;
+    }
+    
+    return resolveField0(interpreter, fieldClass, fieldName, descriptor, isStatic);
+}
+
 int handle_instr_xload(bc_interpreter_t *interpreter, bool wide, uint8_t type) {
     jthread_t *jthread = interpreter->jthread;
     uint16_t index;
@@ -1713,19 +1770,213 @@ int handle_instr_return(bc_interpreter_t *interpreter, bool wide) {
 }
 
 int handle_instr_getstatic(bc_interpreter_t *interpreter, bool wide) {
+    jthread_t *jthread = interpreter->jthread;
+	uint16_t fieldIndex = readShortOperand(jthread, 1);
+	field_t *field = resolveField(interpreter, fieldIndex, true);
+	if(!field)
+	    // exception was already thrown by resolveField
+	    return 0;
 	
+	void *data = field->class->staticFieldData + field->objectOffset;
+	cell_t cell;
+	double_cell_t dcell;
+	switch(field->descriptor[0]) {
+        case 'B':
+            cell.b = *(int8_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_BYTE);
+            break;
+        case 'C':
+            cell.c = *(uint16_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_CHAR);
+            break;
+        case 'D':
+            dcell.d = *(double *) data;
+            pushOperand2(jthread->currentStackFrame, dcell, TYPE_DOUBLE);
+            break;
+        case 'F':
+            cell.f = *(float *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_FLOAT);
+            break;
+        case 'I':
+            cell.i = *(int32_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
+            break;
+        case 'J':
+            dcell.l = *(int64_t *) data;
+            pushOperand2(jthread->currentStackFrame, dcell, TYPE_LONG);
+            break;
+        case 'S':
+            cell.s = *(int16_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_SHORT);
+            break;
+        case 'Z':
+            cell.z = *(uint8_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_BOOLEAN);
+            break;
+        case 'L':
+        case '[':
+        default:
+            cell.a = *(slot_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_REFERENCE);
+            break;
+	}
+	
+	return 3;
 }
 
 int handle_instr_putstatic(bc_interpreter_t *interpreter, bool wide) {
-	
+    jthread_t *jthread = interpreter->jthread;
+    uint16_t fieldIndex = readShortOperand(jthread, 1);
+    field_t *field = resolveField(interpreter, fieldIndex, true);
+    if(!field)
+        // exception has already been thrown by resolveField
+        return 0;
+    
+    void *data = field->class->staticFieldData + field->objectOffset;
+    switch(field->descriptor[0]) {
+        case 'B':
+            *(int8_t *) data = popOperand(jthread->currentStackFrame, NULL).b;
+            break;
+        case 'C':
+            *(uint16_t *) data = popOperand(jthread->currentStackFrame, NULL).c;
+            break;
+        case 'D':
+            *(double *) data = popOperand2(jthread->currentStackFrame, NULL).d;
+            break;
+        case 'F':
+            *(float *) data = popOperand(jthread->currentStackFrame, NULL).f;
+            break;
+        case 'I':
+            *(int32_t *) data = popOperand(jthread->currentStackFrame, NULL).i;
+            break;
+        case 'J':
+            *(int64_t *) data = popOperand2(jthread->currentStackFrame, NULL).l;
+            break;
+        case 'S':
+            *(int16_t *) data = popOperand(jthread->currentStackFrame, NULL).s;
+            break;
+        case 'Z':
+            *(uint8_t *) data = popOperand(jthread->currentStackFrame, NULL).z;
+            break;
+        case 'L':
+        case '[':
+        default:
+            *(slot_t *) data = popOperand(jthread->currentStackFrame, NULL).a;
+            break;
+    }
+    
+    return 3;
 }
 
 int handle_instr_getfield(bc_interpreter_t *interpreter, bool wide) {
-	
+    jthread_t *jthread = interpreter->jthread;
+    object_t *obj = getObject(popOperand(jthread->currentStackFrame, NULL).a);
+    if(!obj) {
+        throwException(interpreter, "java/lang/NullPointerException", "Cannot retrieve field from null");
+        return 0;
+    }
+    
+    uint16_t fieldIndex = readShortOperand(jthread, 1);
+    field_t *field = resolveField(interpreter, fieldIndex, false);
+    if(!field)
+        // exception was already thrown by resolveField
+        return 0;
+    
+    void *data = obj + field->objectOffset;
+    cell_t cell;
+    double_cell_t dcell;
+    switch(field->descriptor[0]) {
+        case 'B':
+            cell.b = *(int8_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_BYTE);
+            break;
+        case 'C':
+            cell.c = *(uint16_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_CHAR);
+            break;
+        case 'D':
+            dcell.d = *(double *) data;
+            pushOperand2(jthread->currentStackFrame, dcell, TYPE_DOUBLE);
+            break;
+        case 'F':
+            cell.f = *(float *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_FLOAT);
+            break;
+        case 'I':
+            cell.i = *(int32_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_INT);
+            break;
+        case 'J':
+            dcell.l = *(int64_t *) data;
+            pushOperand2(jthread->currentStackFrame, dcell, TYPE_LONG);
+            break;
+        case 'S':
+            cell.s = *(int16_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_SHORT);
+            break;
+        case 'Z':
+            cell.z = *(uint8_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_BOOLEAN);
+            break;
+        case 'L':
+        case '[':
+        default:
+            cell.a = *(slot_t *) data;
+            pushOperand(jthread->currentStackFrame, cell, TYPE_REFERENCE);
+            break;
+    }
+    
+    return 3;
 }
 
 int handle_instr_putfield(bc_interpreter_t *interpreter, bool wide) {
-	
+    jthread_t *jthread = interpreter->jthread;
+    object_t *obj = getObject(popOperand(jthread->currentStackFrame, NULL).a);
+    if(!obj) {
+        throwException(interpreter, "java/lang/NullPointerException", "Cannot retrieve field from null");
+        return 0;
+    }
+    
+    uint16_t fieldIndex = readShortOperand(jthread, 1);
+    field_t *field = resolveField(interpreter, fieldIndex, false);
+    if(!field)
+        // exception has already been thrown by resolveField
+        return 0;
+    
+    void *data = obj + field->objectOffset;
+    switch(field->descriptor[0]) {
+        case 'B':
+            *(int8_t *) data = popOperand(jthread->currentStackFrame, NULL).b;
+            break;
+        case 'C':
+            *(uint16_t *) data = popOperand(jthread->currentStackFrame, NULL).c;
+            break;
+        case 'D':
+            *(double *) data = popOperand2(jthread->currentStackFrame, NULL).d;
+            break;
+        case 'F':
+            *(float *) data = popOperand(jthread->currentStackFrame, NULL).f;
+            break;
+        case 'I':
+            *(int32_t *) data = popOperand(jthread->currentStackFrame, NULL).i;
+            break;
+        case 'J':
+            *(int64_t *) data = popOperand2(jthread->currentStackFrame, NULL).l;
+            break;
+        case 'S':
+            *(int16_t *) data = popOperand(jthread->currentStackFrame, NULL).s;
+            break;
+        case 'Z':
+            *(uint8_t *) data = popOperand(jthread->currentStackFrame, NULL).z;
+            break;
+        case 'L':
+        case '[':
+        default:
+            *(slot_t *) data = popOperand(jthread->currentStackFrame, NULL).a;
+            break;
+    }
+    
+    return 3;
 }
 
 int handle_instr_invokevirtual(bc_interpreter_t *interpreter, bool wide) {
@@ -1761,7 +2012,7 @@ int handle_instr_new(bc_interpreter_t *interpreter, bool wide) {
         return 0;
     }
     if(!initializeClass(interpreter, class)) {
-        throwException(interpreter, "java/lang/LinkageError", "Failed to initialize class");
+        throwException(interpreter, "java/lang/ExceptionInInitializerError", "Failed to initialize class");
         return 0;
     }
     
@@ -1815,7 +2066,7 @@ int handle_instr_newarray(bc_interpreter_t *interpreter, bool wide) {
         return 0;
     }
     if(!initializeClass(interpreter, class)) {
-        throwException(interpreter, "java/lang/LinkageError", "Failed to initialize class");
+        throwException(interpreter, "java/lang/ExceptionInInitializerError", "Failed to initialize class");
         return 0;
     }
     
@@ -1843,7 +2094,7 @@ int handle_instr_anewarray(bc_interpreter_t *interpreter, bool wide) {
         return 0;
     }
     if(!initializeClass(interpreter, class)) {
-        throwException(interpreter, "java/lang/LinkageError", "Failed to initialize class");
+        throwException(interpreter, "java/lang/ExceptionInInitializerError", "Failed to initialize class");
         return 0;
     }
     
@@ -1935,7 +2186,7 @@ int handle_instr_multianewarray(bc_interpreter_t *interpreter, bool wide) {
 	    return 0;
 	}
 	if(!initializeClass(interpreter, class)) {
-	    throwException(interpreter, "java/lang/LinkageError", "Failed to initialize class");
+        throwException(interpreter, "java/lang/ExceptionInInitializerError", "Failed to initialize class");
 	    return 0;
 	}
 	

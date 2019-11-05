@@ -332,7 +332,11 @@ class_t *parseClassFile(void *classData) {
         goto fail6;
     
     class->staticDataSize = 0;
-    class->objectSize = sizeof(object_t);
+    if(class->superClass)
+        class->objectSize = class->superClass->objectSize;
+    else
+        class->objectSize = sizeof(object_t);
+    
     for(int i = 0; i < class->numFields; ++i) {
         field_t *field = class->fields + i;
         if(field->flags & FIELD_ACC_STATIC) {
