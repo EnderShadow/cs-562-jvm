@@ -39,7 +39,7 @@ int main(int argc, char **args) {
     char **progArgs = NULL;
     
     if(argc <= 1) {
-        printf("JVM [options] classfile [args]\n    [options] -jar jarfile [args]\n\nOptions:\n    -Xmx<size>\t\t\t\tsize in bytes of the heap\n    -Xss<size>\t\t\t\tsize in bytes of each thread's stack\n    -Xgci<millis>\t\t\tinterval between each garbage collection cycle\n\t-classpath=<classpath>\tadditional classpath to look for classes. Can be a directory, jar, or zip file. This option can be specified multiple times.\n\n\t<size> must be a multiple of 4096 bytes. It can be suffixed with k, m, or g to specify a size in kibibytes, mebibytes, or gibibytes");
+        printf("JVM [options] classfile [args]\n    [options] -jar jarfile [args]\n\nOptions:\n    -Xmx<size>\t\t\t\tsize in bytes of the heap\n    -Xss<size>\t\t\t\tsize in bytes of each thread's stack\n    -Xgci<millis>\t\t\tinterval between each garbage collection cycle\n\t-classpath=<classpath>\tadditional classpath to look for classes. Can be a directory, jar, or zip file. This option can be specified multiple times.\n\n\t<size> must be a multiple of 4096 bytes. It can be suffixed with k, m, or g to specify a size in kibibytes, mebibytes, or gibibytes\n");
         return 0;
     }
     
